@@ -258,6 +258,35 @@ h2 {
     gap: 8px;
 }
 
+.contribute-panel {
+    align-items: center;
+    border: 1px solid var(--line);
+    display: flex;
+    justify-content: space-between;
+    gap: 24px;
+    margin-top: 20px;
+    padding: 24px;
+}
+
+.contribute-panel .muted {
+    margin-top: 8px;
+}
+
+.github-link {
+    border: 1px solid var(--lime);
+    color: var(--ink);
+    font: 11px "DM Mono", monospace;
+    padding: 10px 13px;
+    text-decoration: none;
+    white-space: nowrap;
+}
+
+.github-link:hover,
+.github-link:focus-visible {
+    background: var(--lime);
+    color: #08100a;
+}
+
 .control {
     background: transparent;
     color: var(--muted);

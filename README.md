@@ -78,6 +78,24 @@ NEXT_PUBLIC_MARKET_FEED_URL=https://your-feed.example.com
 
 The feed must allow the Vercel origin through CORS and expose `/stream` and `/config` over HTTPS. The current local JSONL storage and in-memory portfolio are not suitable for a multi-instance production deployment; use a database or a single pinned worker if that state needs to persist.
 
+## Contributing
+
+Contributions are welcome. Open an issue for bugs or ideas, or fork the repository and open a pull request:
+
+https://github.com/zadescoxp/Jev-Trades
+
+Before opening a pull request, run:
+
+```bash
+npm run lint
+npm run build
+python3 -m py_compile pipeline/data_collector.py pipeline/paper_trader.py pipeline/schema.py
+```
+
+## License
+
+Jev Trades is released under the Apache License 2.0. See [LICENSE](LICENSE) for the full license text.
+
 ## Run the application
 
 Use two terminals.

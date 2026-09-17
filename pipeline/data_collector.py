@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,8 +18,8 @@ except ImportError:
 	from paper_trader import PaperTrader
 
 SUPPORTED_SYMBOLS = ("ADA-USD", "XRP-USD", "ETH-USD", "BTC-USD", "SOL-USD", "BNB-USD", "TRX-USD")
-HOST = "127.0.0.1"
-PORT = 8765
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "8765"))
 MAX_BARS = 1000
 STORE_DIR = Path(__file__).with_name("market_data")
 

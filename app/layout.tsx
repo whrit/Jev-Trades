@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Market Desk | BTC-USD",
-  description: "Live BTC-USD one-minute market dashboard.",
+  title: "Jev Trades",
+  description: "Let Jev Trades for you",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

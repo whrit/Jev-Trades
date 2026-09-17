@@ -47,6 +47,24 @@ button {
     padding-bottom: 30px;
 }
 
+.topbar-meta {
+    align-items: flex-end;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.creator-link {
+    color: var(--muted);
+    font: 11px "DM Mono", monospace;
+    text-decoration: none;
+}
+
+.creator-link:hover,
+.creator-link:focus-visible {
+    color: var(--lime);
+}
+
 .eyebrow,
 .label {
     color: var(--muted);

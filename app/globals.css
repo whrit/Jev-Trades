@@ -615,6 +615,486 @@ h2 {
     padding-left: 10px;
 }
 
+/* Active Position Spotlight Card */
+.active-position-card {
+    background: rgba(17, 26, 27, 0.95);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--lime);
+    padding: 14px;
+    margin: 14px 0 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.pos-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.pos-badge {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.pos-side {
+    font: 600 12px "DM Mono", monospace;
+    color: var(--ink);
+    letter-spacing: 0.05em;
+}
+
+.pos-source {
+    font: 10px "DM Mono", monospace;
+    background: rgba(220, 231, 227, 0.08);
+    border: 1px solid var(--line);
+    padding: 2px 6px;
+    color: var(--muted);
+    border-radius: 2px;
+}
+
+.pos-pnl {
+    font: 600 13px "DM Mono", monospace;
+}
+
+.pos-card-body {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px 12px;
+    background: rgba(9, 16, 17, 0.6);
+    padding: 10px;
+    border: 1px solid rgba(36, 53, 54, 0.5);
+}
+
+.pos-metric {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.pos-label {
+    font: 10px "DM Mono", monospace;
+    color: var(--muted);
+}
+
+.pos-metric strong {
+    font: 500 12px "DM Mono", monospace;
+    color: var(--ink);
+    word-break: break-all;
+}
+
+.pos-card-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 4px;
+}
+
+.exit-btn {
+    flex: 1;
+    font: 11px "DM Mono", monospace;
+    padding: 7px 10px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.exit-btn.danger {
+    background: var(--coral);
+    border: 1px solid var(--coral);
+    color: #08100a;
+    font-weight: 600;
+}
+
+.exit-btn.danger:hover:not(:disabled) {
+    background: #ff856c;
+    border-color: #ff856c;
+}
+
+.exit-btn.secondary {
+    background: rgba(239, 113, 86, 0.12);
+    border: 1px solid rgba(239, 113, 86, 0.4);
+    color: var(--coral);
+}
+
+.exit-btn.secondary:hover:not(:disabled) {
+    background: rgba(239, 113, 86, 0.25);
+}
+
+.exit-btn.outline {
+    background: transparent;
+    border: 1px solid var(--line);
+    color: var(--muted);
+}
+
+.exit-btn.outline:hover:not(:disabled) {
+    border-color: var(--lime);
+    color: var(--ink);
+}
+
+.exit-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* TP / SL Edit Inline Box */
+.tpsl-edit-box {
+    background: rgba(9, 16, 17, 0.7);
+    border: 1px solid var(--line);
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.tpsl-edit-inputs {
+    display: flex;
+    gap: 10px;
+}
+
+.tpsl-edit-inputs label {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font: 10px "DM Mono", monospace;
+    color: var(--muted);
+}
+
+.tpsl-edit-inputs input {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    font: 12px "DM Mono", monospace;
+    padding: 5px 8px;
+}
+
+.tpsl-edit-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
+.btn-sm {
+    font: 11px "DM Mono", monospace;
+    padding: 5px 10px;
+    cursor: pointer;
+}
+
+.btn-save {
+    background: var(--lime);
+    border: 1px solid var(--lime);
+    color: #08100a;
+}
+
+.btn-cancel {
+    background: transparent;
+    border: 1px solid var(--line);
+    color: var(--muted);
+}
+
+/* Manual Order Panel */
+.manual-order-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding-top: 14px;
+}
+
+.side-selector {
+    display: flex;
+    border: 1px solid var(--line);
+    background: rgba(9, 16, 17, 0.6);
+}
+
+.side-btn {
+    flex: 1;
+    background: transparent;
+    border: 0;
+    font: 600 11px "DM Mono", monospace;
+    color: var(--muted);
+    padding: 9px 0;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.side-btn.buy-side.active {
+    background: rgba(139, 212, 80, 0.15);
+    color: var(--lime);
+    border-bottom: 2px solid var(--lime);
+}
+
+.side-btn.sell-side.active {
+    background: rgba(239, 113, 86, 0.15);
+    color: var(--coral);
+    border-bottom: 2px solid var(--coral);
+}
+
+.order-field-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.field-label {
+    font: 10px "DM Mono", monospace;
+    color: var(--muted);
+    letter-spacing: 0.08em;
+}
+
+.sizing-mode-toggle {
+    display: flex;
+    gap: 4px;
+}
+
+.mode-btn {
+    background: transparent;
+    border: 1px solid var(--line);
+    color: var(--muted);
+    font: 10px "DM Mono", monospace;
+    padding: 3px 8px;
+    cursor: pointer;
+}
+
+.mode-btn.active {
+    border-color: var(--lime);
+    color: var(--ink);
+    background: rgba(139, 212, 80, 0.08);
+}
+
+.order-input-wrapper {
+    display: flex;
+    flex-direction: column;
+}
+
+.input-group {
+    display: flex;
+    align-items: center;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    padding: 0 10px;
+}
+
+.input-group:focus-within {
+    border-color: var(--lime);
+}
+
+.input-prefix,
+.input-suffix {
+    font: 12px "DM Mono", monospace;
+    color: var(--muted);
+}
+
+.input-group input {
+    flex: 1;
+    background: transparent;
+    border: 0;
+    color: var(--ink);
+    font: 13px "DM Mono", monospace;
+    min-height: 36px;
+    padding: 6px 8px;
+    outline: none;
+    width: 100%;
+}
+
+.input-group.compact {
+    min-height: 30px;
+    padding: 0 8px;
+}
+
+.input-group.compact input {
+    min-height: 28px;
+    padding: 4px 6px;
+    font-size: 11px;
+}
+
+.size-hint {
+    display: flex;
+    justify-content: flex-end;
+    font: 10px "DM Mono", monospace;
+    color: var(--muted);
+    margin-top: -8px;
+}
+
+.quick-presets {
+    display: flex;
+    gap: 6px;
+}
+
+.preset-chip {
+    flex: 1;
+    background: transparent;
+    border: 1px solid var(--line);
+    color: var(--muted);
+    font: 10px "DM Mono", monospace;
+    padding: 5px 0;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.preset-chip:hover {
+    border-color: var(--muted);
+    color: var(--ink);
+}
+
+.preset-chip.sm {
+    flex: none;
+    padding: 4px 8px;
+}
+
+.preset-chip.sm.active {
+    border-color: var(--lime);
+    color: var(--lime);
+    background: rgba(139, 212, 80, 0.08);
+}
+
+.risk-setting-row {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    background: rgba(9, 16, 17, 0.5);
+    border: 1px solid rgba(36, 53, 54, 0.6);
+    padding: 10px;
+}
+
+.risk-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    font: 10px "DM Mono", monospace;
+    color: var(--muted);
+    letter-spacing: 0.06em;
+}
+
+.checkbox-label input[type="checkbox"] {
+    accent-color: var(--lime);
+    cursor: pointer;
+}
+
+.target-calc {
+    font: 10px "DM Mono", monospace;
+}
+
+.risk-input-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.risk-presets {
+    display: flex;
+    gap: 4px;
+}
+
+.sell-info-box {
+    background: rgba(9, 16, 17, 0.5);
+    border: 1px solid var(--line);
+    padding: 12px;
+}
+
+.sell-info-box p {
+    font: 11px/1.5 "DM Mono", monospace;
+    color: var(--muted);
+}
+
+.main-order-btn {
+    min-height: 42px;
+    font: 600 12px "DM Mono", monospace;
+    letter-spacing: 0.05em;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    margin-top: 4px;
+}
+
+.main-order-btn.buy-action {
+    background: var(--lime);
+    border: 1px solid var(--lime);
+    color: #08100a;
+}
+
+.main-order-btn.buy-action:hover:not(:disabled) {
+    background: #9de65f;
+    box-shadow: 0 0 16px rgba(139, 212, 80, 0.3);
+}
+
+.main-order-btn.sell-action {
+    background: var(--coral);
+    border: 1px solid var(--coral);
+    color: #08100a;
+}
+
+.main-order-btn.sell-action:hover:not(:disabled) {
+    background: #ff856c;
+    box-shadow: 0 0 16px rgba(239, 113, 86, 0.3);
+}
+
+.main-order-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.feedback-banner {
+    padding: 8px 12px;
+    font: 11px "DM Mono", monospace;
+    margin-bottom: 10px;
+    border: 1px solid;
+}
+
+.feedback-banner.success {
+    background: rgba(139, 212, 80, 0.1);
+    border-color: var(--lime);
+    color: var(--lime);
+}
+
+.feedback-banner.error {
+    background: rgba(239, 113, 86, 0.1);
+    border-color: var(--coral);
+    color: var(--coral);
+}
+
+.trade-tag-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.trade-reason-tag {
+    font: 9px "DM Mono", monospace;
+    background: rgba(220, 231, 227, 0.08);
+    border: 1px solid var(--line);
+    padding: 2px 5px;
+    color: var(--muted);
+}
+
+.trade-meta-box {
+    background: rgba(9, 16, 17, 0.8);
+    border: 1px solid var(--line);
+    padding: 8px;
+    margin-bottom: 6px;
+}
+
+.trade-meta-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px;
+    font: 11px "DM Mono", monospace;
+    color: var(--ink);
+}
+
+.text-lime {
+    color: var(--lime);
+}
+
+.text-coral {
+    color: var(--coral);
+}
+
 @media (max-width: 900px) {
     .workspace-grid {
         grid-template-columns: 1fr;

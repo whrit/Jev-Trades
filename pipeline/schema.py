@@ -39,6 +39,10 @@ State = {
   "average_entry_price" : "",
   "unrealized_pnl_pct" : "",
   "position_age_bars" : "",
+  "stop_loss_price": "",
+  "take_profit_price": "",
+  "stop_loss_pct": "",
+  "take_profit_pct": "",
   "max_wallet_position_pct" : "75%",
   "price" : {
     "atr14" : "day high - day low",
@@ -109,6 +113,24 @@ Questions = {
       "Half reduction: multiple exhaustion signals or MAs flattening.",
       "Full exit: broad-based reversal evidence or a clear trend breakdown."
     ]
+  },
+  "stop_loss_target": {
+    "type": "choice",
+    "instructions": "If entering or managing a position, what stop loss distance is appropriate given the current volatility regime, recent swing low, and support levels?",
+    "criteria": {
+      "tight": "Tight stop loss (0.75% to 1.5% below entry) for quick scalp or high conviction setups with tight invalidation.",
+      "moderate": "Standard stop loss (2.0% to 3.5% below entry) placed below key short-term moving average support (EMA 20 / SMA 50).",
+      "wide": "Wide stop loss (4.0% to 6.0% below entry) for volatile swings or longer holding periods."
+    }
+  },
+  "take_profit_target": {
+    "type": "choice",
+    "instructions": "If entering or managing a position, what take profit target aligns best with momentum and upside resistance?",
+    "criteria": {
+      "conservative": "Quick profit target (1.5% to 3.0% gain) near immediate local resistance or oscillator peak.",
+      "balanced": "Balanced target (3.5% to 6.5% gain) aiming for trend expansion with healthy risk-reward.",
+      "aggressive": "Extended runner target (7.0% to 12.0%+ gain) targeting multi-tier breakout or strong momentum rally."
+    }
   },
   "low_reliability_setup": {
     "type": "noul",

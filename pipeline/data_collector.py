@@ -9,6 +9,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 import yfinance as yf
@@ -26,7 +27,7 @@ STORE_DIR = Path(__file__).with_name("market_data")
 
 class MarketState:
 	def __init__(self) -> None:
-		self.lock = threading.Lock()
+		self.lock = threading.RLock()
 		self.selected_symbol = "BTC-USD"
 		self.trading_enabled = False
 		self.markets: dict[str, dict[str, Any]] = {symbol: {"bars": [], "current": None, "last_tick": None, "status": "starting"} for symbol in SUPPORTED_SYMBOLS}
@@ -55,17 +56,18 @@ class MarketState:
 			bars = market["bars"][-MAX_BARS:]
 			current = market["current"]
 			indicator_series = calculate_indicator_series(bars)
+			price = current["close"] if current else (bars[-1]["close"] if bars else None)
 			return {
 				"symbol": selected,
 				"supported_symbols": SUPPORTED_SYMBOLS,
 				"status": market["status"],
 				"server_time": int(time.time()),
 				"last_tick": market["last_tick"],
-				"price": current["close"] if current else (bars[-1]["close"] if bars else None),
+				"price": price,
 				"bars": bars + ([current] if current else []),
 				"indicators": calculate_indicators(bars),
 				"indicator_series": indicator_series,
-				"trading": TRADER.snapshot(current["close"] if current else (bars[-1]["close"] if bars else None), selected),
+				"trading": TRADER.snapshot(price, selected),
 				"settings": {"capital": self.capital, "max_wallet_position_pct": self.max_wallet_position_pct, "risk_appetite": self.risk_appetite},
 				"trading_enabled": self.trading_enabled,
 			}
@@ -168,6 +170,7 @@ def calculate_indicators(bars: list[dict[str, Any]]) -> dict[str, float | None]:
 		"rsi14": _last(rsi.iloc[-1]),
 		"macd": _last(macd.iloc[-1]),
 		"signal": _last(macd_signal.iloc[-1]),
+		"atr14": _last(atr14.iloc[-1]),
 	})
 	return result
 
@@ -199,6 +202,10 @@ def add_tick(symbol: str, timestamp: float, price: float, volume: float | None =
 			if volume is not None:
 				market["current"]["volume"] = max(market["current"]["volume"], volume)
 		market["status"] = "live"
+
+	# Check TP / SL triggers for active positions in real-time
+	TRADER.check_tp_sl(symbol, price)
+
 	if STATE.trading_enabled and symbol == STATE.selected_symbol:
 		TRADER.submit(build_agent_state(symbol))
 
@@ -257,10 +264,14 @@ def build_agent_state(symbol: str) -> dict[str, Any]:
 			"position_quantity": position.get("quantity", 0.0),
 			"average_entry_price": position.get("average_entry_price"),
 			"unrealized_pnl_pct": position.get("unrealized_pnl_pct", 0.0),
+			"stop_loss_price": position.get("stop_loss_price"),
+			"take_profit_price": position.get("take_profit_price"),
+			"stop_loss_pct": position.get("stop_loss_pct"),
+			"take_profit_pct": position.get("take_profit_pct"),
 			"position_age_bars": 0,
 			"max_wallet_position_pct": STATE.max_wallet_position_pct,
 			"risk_appetite": STATE.risk_appetite,
-			"price": {"change_percent": ((price - day_open) / day_open) * 100 if day_open else 0, "day_high": day_high, "day_low": day_low, "open_price": day_open, "day_volume": day_volume},
+			"price": {"change_percent": ((price - day_open) / day_open) * 100 if day_open else 0, "day_high": day_high, "day_low": day_low, "open_price": day_open, "day_volume": day_volume, "atr14": indicators.get("atr14")},
 		}
 
 
@@ -317,11 +328,10 @@ class FeedHandler(BaseHTTPRequestHandler):
 		self.send_response(204)
 		self.send_header("Access-Control-Allow-Origin", "*")
 		self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		self.send_header("Access-Control-Allow-Headers", "Content-Type")
+		self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		self.end_headers()
 
 	def do_GET(self) -> None:  # noqa: N802
-		from urllib.parse import parse_qs, urlparse
 		query = parse_qs(urlparse(self.path).query)
 		selected = query.get("symbol", [None])[0]
 		if self.path == "/health":
@@ -344,9 +354,9 @@ class FeedHandler(BaseHTTPRequestHandler):
 		except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
 			return
 
-	def send_json(self, payload: dict[str, Any]) -> None:
+	def send_json(self, payload: dict[str, Any], status: int = 200) -> None:
 		body = json.dumps(payload).encode()
-		self.send_response(200)
+		self.send_response(status)
 		self.send_header("Content-Type", "application/json")
 		self.send_header("Content-Length", str(len(body)))
 		self.send_header("Access-Control-Allow-Origin", "*")
@@ -354,17 +364,86 @@ class FeedHandler(BaseHTTPRequestHandler):
 		self.wfile.write(body)
 
 	def do_POST(self) -> None:  # noqa: N802
-		from urllib.parse import urlparse
-		if urlparse(self.path).path != "/config":
-			self.send_error(404)
+		path = urlparse(self.path).path
+		if path == "/config":
+			try:
+				payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+				STATE.configure(
+					payload.get("symbol"),
+					float(payload["capital"]) if payload.get("capital") is not None else None,
+					float(payload["max_wallet_position_pct"]) if payload.get("max_wallet_position_pct") is not None else None,
+					payload.get("risk_appetite"),
+					bool(payload["trading_enabled"]) if payload.get("trading_enabled") is not None else None,
+				)
+				TRADER.configure(STATE.capital, STATE.max_wallet_position_pct, STATE.risk_appetite, payload.get("typesafe_api_key"))
+				self.send_json({"ok": True, "settings": {"symbol": STATE.selected_symbol, "capital": STATE.capital, "max_wallet_position_pct": STATE.max_wallet_position_pct, "risk_appetite": STATE.risk_appetite, "trading_enabled": STATE.trading_enabled}})
+			except (TypeError, ValueError, json.JSONDecodeError) as e:
+				self.send_json({"ok": False, "error": str(e)}, status=400)
 			return
-		try:
-			payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
-			STATE.configure(payload.get("symbol"), float(payload["capital"]) if payload.get("capital") is not None else None, float(payload["max_wallet_position_pct"]) if payload.get("max_wallet_position_pct") is not None else None, payload.get("risk_appetite"), bool(payload["trading_enabled"]) if payload.get("trading_enabled") is not None else None)
-			TRADER.configure(STATE.capital, STATE.max_wallet_position_pct, STATE.risk_appetite, payload.get("typesafe_api_key"))
-			self.send_json({"ok": True, "settings": {"symbol": STATE.selected_symbol, "capital": STATE.capital, "max_wallet_position_pct": STATE.max_wallet_position_pct, "risk_appetite": STATE.risk_appetite, "trading_enabled": STATE.trading_enabled}})
-		except (TypeError, ValueError, json.JSONDecodeError):
-			self.send_error(400)
+
+		if path == "/order":
+			try:
+				payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+				action = payload.get("action")
+				symbol = payload.get("symbol") or STATE.selected_symbol
+				market_snapshot = STATE.snapshot(symbol)
+				current_price = market_snapshot.get("price")
+				if not current_price or current_price <= 0:
+					self.send_json({"ok": False, "error": f"No active market price available for {symbol}"}, status=400)
+					return
+
+				if action == "buy":
+					quantity = float(payload["quantity"]) if payload.get("quantity") is not None and float(payload["quantity"]) > 0 else None
+					amount_usd = float(payload["amount_usd"]) if payload.get("amount_usd") is not None and float(payload["amount_usd"]) > 0 else None
+					stop_loss_pct = float(payload["stop_loss_pct"]) if payload.get("stop_loss_pct") is not None and float(payload["stop_loss_pct"]) > 0 else None
+					stop_loss_price = float(payload["stop_loss_price"]) if payload.get("stop_loss_price") is not None and float(payload["stop_loss_price"]) > 0 else None
+					take_profit_pct = float(payload["take_profit_pct"]) if payload.get("take_profit_pct") is not None and float(payload["take_profit_pct"]) > 0 else None
+					take_profit_price = float(payload["take_profit_price"]) if payload.get("take_profit_price") is not None and float(payload["take_profit_price"]) > 0 else None
+
+					trade = TRADER.manual_buy(
+						symbol=symbol,
+						price=current_price,
+						quantity=quantity,
+						amount_usd=amount_usd,
+						stop_loss_pct=stop_loss_pct,
+						stop_loss_price=stop_loss_price,
+						take_profit_pct=take_profit_pct,
+						take_profit_price=take_profit_price,
+					)
+					self.send_json({"ok": True, "trade": trade, "snapshot": TRADER.snapshot(current_price, symbol)})
+					return
+
+				elif action in ("sell", "exit"):
+					pct = float(payload.get("pct_of_position", 1.0)) if action != "exit" else 1.0
+					quantity = float(payload["quantity"]) if payload.get("quantity") is not None and float(payload["quantity"]) > 0 else None
+					trade = TRADER.manual_sell(symbol=symbol, price=current_price, quantity=quantity, pct_of_position=pct)
+					self.send_json({"ok": True, "trade": trade, "snapshot": TRADER.snapshot(current_price, symbol)})
+					return
+
+				elif action == "update_tp_sl":
+					stop_loss_pct = float(payload["stop_loss_pct"]) if payload.get("stop_loss_pct") is not None else None
+					stop_loss_price = float(payload["stop_loss_price"]) if payload.get("stop_loss_price") is not None else None
+					take_profit_pct = float(payload["take_profit_pct"]) if payload.get("take_profit_pct") is not None else None
+					take_profit_price = float(payload["take_profit_price"]) if payload.get("take_profit_price") is not None else None
+
+					updated = TRADER.update_tp_sl(
+						symbol=symbol,
+						stop_loss_pct=stop_loss_pct,
+						stop_loss_price=stop_loss_price,
+						take_profit_pct=take_profit_pct,
+						take_profit_price=take_profit_price,
+					)
+					self.send_json({"ok": True, "position": updated, "snapshot": TRADER.snapshot(current_price, symbol)})
+					return
+
+				else:
+					self.send_json({"ok": False, "error": f"Unsupported order action '{action}'"}, status=400)
+					return
+			except Exception as error:
+				self.send_json({"ok": False, "error": str(error)}, status=400)
+			return
+
+		self.send_error(404)
 
 	def log_message(self, format: str, *args: Any) -> None:
 		return

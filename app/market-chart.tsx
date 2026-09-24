@@ -70,7 +70,12 @@ export default function MarketChart({
   useEffect(() => {
     const { candles, volume } = seriesRef.current;
     if (!candles || !volume || !bars.length) return;
-    const latestBar = bars[bars.length - 1];
+    
+    // De-duplicate and sort bars to strictly ascending order to prevent chart crashes
+    const uniqueBars = Array.from(new Map(bars.map((bar) => [bar.time, bar])).values());
+    const sortedBars = uniqueBars.sort((a, b) => a.time - b.time);
+    
+    const latestBar = sortedBars[sortedBars.length - 1];
     const latestCandle = { ...latestBar, time: latestBar.time as UTCTimestamp };
     const latestVolume = {
       time: latestBar.time as UTCTimestamp,
@@ -78,13 +83,24 @@ export default function MarketChart({
       color: latestBar.close >= latestBar.open ? "#41624f" : "#693e3b",
     };
     if (!initializedRef.current) {
-      candles.setData(bars.map((bar) => ({ ...bar, time: bar.time as UTCTimestamp })));
-      volume.setData(bars.map((bar) => ({ time: bar.time as UTCTimestamp, value: bar.volume, color: bar.close >= bar.open ? "#41624f" : "#693e3b" })));
+      candles.setData(sortedBars.map((bar) => ({ ...bar, time: bar.time as UTCTimestamp })));
+      volume.setData(sortedBars.map((bar) => ({ time: bar.time as UTCTimestamp, value: bar.volume, color: bar.close >= bar.open ? "#41624f" : "#693e3b" })));
       initializedRef.current = true;
       chartRef.current?.timeScale().fitContent();
-    } else if (renderedTimeRef.current === latestBar.time || (renderedTimeRef.current !== null && latestBar.time > renderedTimeRef.current)) {
-      candles.update(latestCandle);
-      volume.update(latestVolume);
+    } else if (renderedTimeRef.current !== null && latestBar.time < renderedTimeRef.current) {
+      // Time went backwards (e.g. timeframe changed) — full reset
+      candles.setData(sortedBars.map((bar) => ({ ...bar, time: bar.time as UTCTimestamp })));
+      volume.setData(sortedBars.map((bar) => ({ time: bar.time as UTCTimestamp, value: bar.volume, color: bar.close >= bar.open ? "#41624f" : "#693e3b" })));
+      chartRef.current?.timeScale().fitContent();
+    } else {
+      try {
+        candles.update(latestCandle);
+        volume.update(latestVolume);
+      } catch {
+        // Fallback: full reset if update fails (e.g. time mismatch)
+        candles.setData(sortedBars.map((bar) => ({ ...bar, time: bar.time as UTCTimestamp })));
+        volume.setData(sortedBars.map((bar) => ({ time: bar.time as UTCTimestamp, value: bar.volume, color: bar.close >= bar.open ? "#41624f" : "#693e3b" })));
+      }
     }
     renderedTimeRef.current = latestBar.time;
     const chart = chartRef.current;
@@ -104,13 +120,12 @@ export default function MarketChart({
         });
       }
       const values = name === "ema20" ? indicatorSeries.ema20 : indicatorSeries.sma50;
-      if (!overlayStateRef.current.includes(name)) {
-        seriesRef.current[name].setData(bars.slice(0, values.length).flatMap((bar, index) => (values[index] === null ? [] : [{ time: bar.time as UTCTimestamp, value: values[index] as number }])));
-      } else if (values.length > 0) {
-        const latestValue = values[values.length - 1];
-        const latestCompletedBar = bars[values.length - 1];
-        if (latestValue !== null && latestCompletedBar) seriesRef.current[name].update({ time: latestCompletedBar.time as UTCTimestamp, value: latestValue });
-      }
+      // Always use setData for overlays to avoid time mismatch issues with update()
+      seriesRef.current[name].setData(
+        sortedBars.slice(0, values.length).flatMap((bar, index) =>
+          values[index] === null ? [] : [{ time: bar.time as UTCTimestamp, value: values[index] as number }]
+        )
+      );
     }
     overlayStateRef.current = overlayState;
   }, [bars, indicatorSeries, overlays]);

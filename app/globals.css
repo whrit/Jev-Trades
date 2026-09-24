@@ -256,6 +256,23 @@ h2 {
 .controls {
     display: flex;
     gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.tf-switcher {
+    display: flex;
+    gap: 4px;
+    padding-right: 10px;
+    margin-right: 6px;
+    border-right: 1px solid var(--line);
+}
+
+.tf-switcher .control {
+    padding: 4px 10px;
+    font-size: 0.72rem;
+    letter-spacing: 0.04em;
+    min-width: unset;
 }
 
 .contribute-panel {

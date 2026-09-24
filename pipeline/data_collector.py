@@ -35,6 +35,8 @@ class MarketState:
 		self.max_wallet_position_pct = 0.75
 		self.risk_appetite = "balanced"
 		self.status = "starting"
+		self.active_timeframes = ["1m"]
+		self.chart_timeframe = "1m"
 
 	def configure(self, symbol: str | None = None, capital: float | None = None, max_wallet_position_pct: float | None = None, risk_appetite: str | None = None, trading_enabled: bool | None = None) -> None:
 		with self.lock:
@@ -49,14 +51,29 @@ class MarketState:
 			if trading_enabled is not None:
 				self.trading_enabled = trading_enabled
 
-	def snapshot(self, symbol: str | None = None) -> dict[str, Any]:
+	def set_active_timeframes(self, timeframes: list[str]) -> None:
+		with self.lock:
+			self.active_timeframes = timeframes
+
+	def snapshot(self, symbol: str | None = None, timeframe: str | None = None) -> dict[str, Any]:
 		with self.lock:
 			selected = symbol if symbol in SUPPORTED_SYMBOLS else self.selected_symbol
+			tf = timeframe or self.chart_timeframe or "1m"
 			market = self.markets[selected]
-			bars = market["bars"][-MAX_BARS:]
+			raw_bars = market["bars"][-MAX_BARS:]
 			current = market["current"]
-			indicator_series = calculate_indicator_series(bars)
-			price = current["close"] if current else (bars[-1]["close"] if bars else None)
+			all_raw = raw_bars + ([current] if current else [])
+			price = current["close"] if current else (raw_bars[-1]["close"] if raw_bars else None)
+			
+			# Resample bars for the selected timeframe
+			if tf != "1m" and all_raw:
+				display_bars = resample_bars(all_raw, tf)
+				completed_for_indicators = resample_bars(raw_bars, tf)
+			else:
+				display_bars = all_raw
+				completed_for_indicators = raw_bars
+			
+			indicator_series = calculate_indicator_series(completed_for_indicators)
 			return {
 				"symbol": selected,
 				"supported_symbols": SUPPORTED_SYMBOLS,
@@ -64,11 +81,11 @@ class MarketState:
 				"server_time": int(time.time()),
 				"last_tick": market["last_tick"],
 				"price": price,
-				"bars": bars + ([current] if current else []),
-				"indicators": calculate_indicators(bars),
+				"bars": display_bars,
+				"indicators": calculate_indicators(completed_for_indicators),
 				"indicator_series": indicator_series,
 				"trading": TRADER.snapshot(price, selected),
-				"settings": {"capital": self.capital, "max_wallet_position_pct": self.max_wallet_position_pct, "risk_appetite": self.risk_appetite},
+				"settings": {"capital": self.capital, "max_wallet_position_pct": self.max_wallet_position_pct, "risk_appetite": self.risk_appetite, "active_timeframes": self.active_timeframes, "chart_timeframe": tf},
 				"trading_enabled": self.trading_enabled,
 			}
 
@@ -183,17 +200,58 @@ def calculate_indicator_series(bars: list[dict[str, Any]]) -> dict[str, list[flo
 		series[f"sma_{period}"] = close.rolling(period).mean()
 	return {name.replace("_", "") if name in ("ema_20", "sma_50") else name: [_last(value) for value in values] for name, values in series.items()}
 
+def resample_bars(bars: list[dict[str, Any]], tf: str) -> list[dict[str, Any]]:
+	if not bars or tf == "1m":
+		return bars
+	df = pd.DataFrame(bars)
+	df["datetime"] = pd.to_datetime(df["time"], unit="s")
+	df.set_index("datetime", inplace=True)
+	
+	rule = tf.upper().replace("M", "T")
+	resampled = df.resample(rule, label='left', closed='left').agg({
+		"time": "first",
+		"open": "first",
+		"high": "max",
+		"low": "min",
+		"close": "last",
+		"volume": "sum"
+	}).dropna()
+	return resampled.to_dict("records")
 
 def add_tick(symbol: str, timestamp: float, price: float, volume: float | None = None) -> None:
 	minute = int(timestamp // 60) * 60
+	closed_tfs: list[str] = []
 	with STATE.lock:
 		market = STATE.markets[symbol]
+		
+		# Protect against delayed, out-of-order ticks from Yahoo Finance
+		if market["current"] is not None and minute < market["current"]["time"]:
+			return
+			
 		market["last_tick"] = timestamp
-		if market["current"] is None or market["current"]["time"] != minute:
+		
+		# Detect bar close BEFORE updating the current bar
+		bar_closed = market["current"] is not None and market["current"]["time"] != minute
+		
+		if market["current"] is None or bar_closed:
 			if market["current"] is not None:
 				market["bars"].append(market["current"])
 				market["bars"] = market["bars"][-MAX_BARS:]
 				append_stored_bar(symbol, market["bars"][-1])
+				
+				# This 1m bar just closed - check which timeframes closed
+				closed_tfs.append("1m")
+				for tf in STATE.active_timeframes:
+					if tf == "1m":
+						continue
+					if "h" in tf:
+						tf_minutes = int(tf.replace("h", "")) * 60
+					else:
+						tf_minutes = int(tf.replace("m", ""))
+					# A higher-TF bar closes when the NEW minute aligns to that TF boundary
+					if minute % (tf_minutes * 60) == 0:
+						closed_tfs.append(tf)
+			
 			market["current"] = {"time": minute, "open": price, "high": price, "low": price, "close": price, "volume": volume or 0}
 		else:
 			market["current"]["high"] = max(market["current"]["high"], price)
@@ -203,11 +261,14 @@ def add_tick(symbol: str, timestamp: float, price: float, volume: float | None =
 				market["current"]["volume"] = max(market["current"]["volume"], volume)
 		market["status"] = "live"
 
-	# Check TP / SL triggers for active positions in real-time
-	TRADER.check_tp_sl(symbol, price)
+	# Check TP / SL triggers for active positions in real-time for ALL active timeframes
+	for tf in STATE.active_timeframes:
+		TRADER.check_tp_sl(symbol, price, tf)
 
+	# Submit to Jev for active timeframes on every tick
 	if STATE.trading_enabled and symbol == STATE.selected_symbol:
-		TRADER.submit(build_agent_state(symbol))
+		for tf in STATE.active_timeframes:
+			TRADER.submit(build_agent_state(symbol, tf))
 
 
 def append_stored_bar(symbol: str, bar: dict[str, Any]) -> None:
@@ -232,13 +293,17 @@ def read_stored_bars(symbol: str) -> dict[int, dict[str, Any]]:
 	return bars
 
 
-def build_agent_state(symbol: str) -> dict[str, Any]:
+def build_agent_state(symbol: str, timeframe: str = "1m") -> dict[str, Any]:
 	with STATE.lock:
 		market = STATE.markets[symbol]
 		completed = market["bars"][-MAX_BARS:]
 		current = market["current"]
 		bars = completed + ([current] if current else [])
-		indicators = calculate_indicators(completed)
+		
+		resampled_completed = resample_bars(completed, timeframe)
+		resampled_bars = resample_bars(bars, timeframe)
+		
+		indicators = calculate_indicators(resampled_completed)
 		price = current["close"] if current else (completed[-1]["close"] if completed else None)
 		if price is None:
 			return {}
@@ -248,7 +313,9 @@ def build_agent_state(symbol: str) -> dict[str, Any]:
 		day_open = day_bars[0]["open"] if day_bars else price
 		day_volume = sum(bar["volume"] for bar in day_bars)
 		trading = TRADER.snapshot(price, symbol)["account"]
-		position = trading["positions"].get(symbol, {})
+		
+		position_key = symbol if timeframe == "1m" else f"{symbol}:{timeframe}"
+		position = trading["positions"].get(position_key, {})
 		return {
 			"symbol": symbol,
 			"current_price": price,
@@ -256,7 +323,7 @@ def build_agent_state(symbol: str) -> dict[str, Any]:
 			"moving_averages": {key: indicators.get(key) for key in ("ema_10", "sma_10", "ema_20", "sma_20", "ema_30", "sma_30", "ema_50", "sma_50", "ema_100", "sma_100", "ema_200", "sma_200", "ichimoku_base_line_9_26_52_26", "vwma_20", "hull_ma_9")},
 			"position": position.get("position", "None"),
 			"quantity": position.get("quantity", 0.0),
-			"time_frame": "1 minute",
+			"time_frame": f"{timeframe.replace('m', ' minute').replace('h', ' hour')}",
 			"cash_balance": trading["cash_balance"],
 			"capital": trading["starting_cash"],
 			"equity": trading["equity"],
@@ -337,9 +404,21 @@ class FeedHandler(BaseHTTPRequestHandler):
 		if self.path == "/health":
 			self.send_json({"ok": True, "status": "live" if any(market["status"] == "live" for market in STATE.markets.values()) else "starting"})
 			return
+		path = urlparse(self.path).path
+		if path == "/history":
+			try:
+				from . import db
+				trades = db.get_trades(100)
+				ledger = db.get_ledger(100)
+				self.send_json({"ok": True, "trades": trades, "ledger": ledger})
+			except Exception as error:
+				self.send_json({"ok": False, "error": str(error)}, status=400)
+			return
+            
 		if urlparse(self.path).path != "/stream":
 			self.send_error(404)
 			return
+		timeframe = query.get("timeframe", [None])[0]
 		self.send_response(200)
 		self.send_header("Content-Type", "text/event-stream")
 		self.send_header("Cache-Control", "no-cache")
@@ -347,7 +426,7 @@ class FeedHandler(BaseHTTPRequestHandler):
 		self.end_headers()
 		try:
 			while True:
-				payload = json.dumps(STATE.snapshot(selected), separators=(",", ":"))
+				payload = json.dumps(STATE.snapshot(selected, timeframe), separators=(",", ":"))
 				self.wfile.write(f"data: {payload}\n\n".encode())
 				self.wfile.flush()
 				time.sleep(1)
@@ -375,8 +454,10 @@ class FeedHandler(BaseHTTPRequestHandler):
 					payload.get("risk_appetite"),
 					bool(payload["trading_enabled"]) if payload.get("trading_enabled") is not None else None,
 				)
+				if payload.get("active_timeframes"):
+					STATE.set_active_timeframes(payload["active_timeframes"])
 				TRADER.configure(STATE.capital, STATE.max_wallet_position_pct, STATE.risk_appetite, payload.get("typesafe_api_key"))
-				self.send_json({"ok": True, "settings": {"symbol": STATE.selected_symbol, "capital": STATE.capital, "max_wallet_position_pct": STATE.max_wallet_position_pct, "risk_appetite": STATE.risk_appetite, "trading_enabled": STATE.trading_enabled}})
+				self.send_json({"ok": True, "settings": {"symbol": STATE.selected_symbol, "capital": STATE.capital, "max_wallet_position_pct": STATE.max_wallet_position_pct, "risk_appetite": STATE.risk_appetite, "trading_enabled": STATE.trading_enabled, "active_timeframes": STATE.active_timeframes}})
 			except (TypeError, ValueError, json.JSONDecodeError) as e:
 				self.send_json({"ok": False, "error": str(e)}, status=400)
 			return

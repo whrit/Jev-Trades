@@ -2,7 +2,7 @@
 
 A Next.js dashboard for live crypto market data and TypeSafe-powered paper trading.
 
-The system streams one-minute candles from Yahoo Finance through `yfinance`, calculates technical indicators, sends explicitly enabled trading states to TypeSafe, and applies the returned decisions to a simulated portfolio. No broker or live order API is connected.
+The system streams live market data from Yahoo Finance through `yfinance`, calculates technical indicators across multiple timeframes, sends explicitly enabled trading states to TypeSafe, and applies the returned decisions to a simulated portfolio powered by a local SQLite database. It features both autonomous trading by the Jev agent and a fully-featured manual trade desk with automatic Take Profit and Stop Loss execution. No broker or live order API is connected.
 
 ## See It In Action
 
@@ -20,6 +20,17 @@ The dashboard combines live market data, technical indicators, TypeSafe decision
     <td align="center"><strong>Portfolio position</strong></td>
   </tr>
 </table>
+
+## Features
+
+- **Live Market Data & Dynamic Timeframes:** Streams live market data via Yahoo Finance websockets. The chart and technical indicators dynamically update based on the selected timeframe (1m, 5m, 15m, 1h, 4h).
+- **Autonomous Agent (Jev):** Powered by TypeSafe, the Jev autonomous decision engine analyzes the market on *every incoming tick* across all active timeframes simultaneously, providing structured judgments for trading.
+- **Paper Trading Portfolio:** Simulated trading environment with a persistent SQLite database. Capital can be dynamically adjusted through the UI, accurately updating the account ledger and portfolio equity on the fly.
+- **Automated Risk Management:** Automatic calculation and execution of Take Profit and Stop Loss triggers, determined by Jev's analysis, volatility (ATR), and user risk appetite.
+- **Manual Trade Execution:** A complete manual trading desk allowing users to execute buys and sells, set custom TP/SL targets, or exit active positions directly from the dashboard.
+- **Robust Data Handling:** Built-in safeguards to filter out delayed or out-of-order market ticks, preventing data corruption and chart crashes.
+- **Interactive UI:** Dynamic chart overlays, selectable indicator panels, and detailed historical logs for both agent decisions and executed trades.
+
 
 ## Supported assets
 

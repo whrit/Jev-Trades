@@ -139,6 +139,9 @@ export default function Home() {
   const [overlays, setOverlays] = useState(["ema20"]);
   const [selectedIndicators, setSelectedIndicators] = useState(["ema_20", "sma_50", "relative_strength_index_14", "macd_level_12_26"]);
   const [activityTab, setActivityTab] = useState<"manual" | "logs" | "positions">("manual");
+  const [activeTimeframes, setActiveTimeframes] = useState<string[]>(["1m"]);
+  const [tradeTimeframe, setTradeTimeframe] = useState<string>("1m");
+  const [chartTimeframe, setChartTimeframe] = useState<string>("1m");
 
   // Manual Trading State
   const [orderSide, setOrderSide] = useState<"buy" | "sell">("buy");
@@ -158,7 +161,7 @@ export default function Home() {
   const [editSlVal, setEditSlVal] = useState("");
 
   useEffect(() => {
-    const source = new EventSource(`${streamBase}?symbol=${encodeURIComponent(symbol)}`);
+    const source = new EventSource(`${streamBase}?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(chartTimeframe)}`);
     source.onmessage = (event) => {
       const next = JSON.parse(event.data) as Snapshot;
       setSnapshot(next);
@@ -166,7 +169,7 @@ export default function Home() {
     };
     source.onerror = () => setSnapshot((current) => (current ? { ...current, status: "feed unavailable" } : null));
     return () => source.close();
-  }, [symbol]);
+  }, [symbol, chartTimeframe]);
 
   const configurePortfolio = async (enabled = tradingEnabled, selectedSymbol = symbol) => {
     try {
@@ -180,6 +183,7 @@ export default function Home() {
           risk_appetite: riskAppetite,
           trading_enabled: enabled,
           typesafe_api_key: typeSafeKey.trim() || undefined,
+          active_timeframes: activeTimeframes,
         }),
       });
       if (!response.ok) throw new Error(`Configuration request failed (${response.status})`);
@@ -210,6 +214,7 @@ export default function Home() {
       const payload: Record<string, any> = {
         action,
         symbol,
+        timeframe: tradeTimeframe,
         ...extraParams,
       };
 
@@ -263,6 +268,7 @@ export default function Home() {
         body: JSON.stringify({
           action: "update_tp_sl",
           symbol,
+          timeframe: tradeTimeframe,
           take_profit_pct: editTpVal ? Number(editTpVal) : undefined,
           stop_loss_pct: editSlVal ? Number(editSlVal) : undefined,
         }),
@@ -298,7 +304,7 @@ export default function Home() {
           <p className="eyebrow">JEV TRADES / LIVE FEED</p>
           <h1>{symbol}</h1>
           <p className="muted">
-            {symbol} <span className="dot" /> 1 minute candles
+            {symbol} <span className="dot" /> {chartTimeframe === "1m" ? "1 minute" : chartTimeframe === "5m" ? "5 minute" : chartTimeframe === "15m" ? "15 minute" : chartTimeframe === "1h" ? "1 hour" : "4 hour"} candles
           </p>
         </div>
         <div className="topbar-meta">
@@ -351,6 +357,16 @@ export default function Home() {
           TYPESAFE KEY
           <input type="password" autoComplete="off" placeholder="Optional if server has one" value={typeSafeKey} onChange={(event) => setTypeSafeKey(event.target.value)} />
         </label>
+        <label>
+          TIMEFRAMES
+          <select multiple value={activeTimeframes} onChange={(e) => setActiveTimeframes(Array.from(e.target.selectedOptions, option => option.value))} style={{ height: "60px" }}>
+            <option value="1m">1m</option>
+            <option value="5m">5m</option>
+            <option value="15m">15m</option>
+            <option value="1h">1h</option>
+            <option value="4h">4h</option>
+          </select>
+        </label>
         <button className="control" onClick={() => void configurePortfolio()}>
           Apply portfolio
         </button>
@@ -379,6 +395,13 @@ export default function Home() {
                 <h2>{symbol} / USD</h2>
               </div>
               <div className="controls">
+                <div className="tf-switcher">
+                  {["1m", "5m", "15m", "1h", "4h"].map((tf) => (
+                    <button key={tf} className={chartTimeframe === tf ? "control active" : "control"} onClick={() => setChartTimeframe(tf)}>
+                      {tf}
+                    </button>
+                  ))}
+                </div>
                 {[
                   ["ema20", "EMA 20"],
                   ["sma50", "SMA 50"],
@@ -601,6 +624,19 @@ export default function Home() {
                 >
                   SELL / EXIT
                 </button>
+              </div>
+              
+              <div className="order-field-row">
+                <span className="field-label">TIMEFRAME SLOT</span>
+                <div className="sizing-mode-toggle">
+                  <select value={tradeTimeframe} onChange={(e) => setTradeTimeframe(e.target.value)} style={{ padding: '6px', background: 'transparent', color: 'white', border: '1px solid var(--border)', borderRadius: '4px' }}>
+                    <option value="1m">1m</option>
+                    <option value="5m">5m</option>
+                    <option value="15m">15m</option>
+                    <option value="1h">1h</option>
+                    <option value="4h">4h</option>
+                  </select>
+                </div>
               </div>
 
               {/* Sizing Mode Switch */}

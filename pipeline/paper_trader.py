@@ -10,10 +10,11 @@ import threading
 import time
 import urllib.request
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import ROUND_DOWN, Decimal
 from typing import Any, cast
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from alpaca.common.exceptions import APIError
 from alpaca.data.historical import OptionHistoricalDataClient, StockHistoricalDataClient
@@ -43,12 +44,13 @@ from alpaca.trading.requests import (
 )
 
 if __package__:
-    from . import config, db
-    from .schema import Questions
+    from . import config, db, options
+    from .schema import Questions, option_questions
 else:
     import config
     import db
-    from schema import Questions
+    import options
+    from schema import Questions, option_questions
 
 TERMINAL = {"filled", "canceled", "expired", "rejected", "replaced"}
 TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone"
@@ -84,9 +86,10 @@ class PaperTrader:
         self.risk_appetite = risk_appetite
         self.api_key = os.getenv("TYPESAFE_API_KEY") or os.getenv("TYPESAFE_AI_API_KEY", "")
         self.enabled = False
-        self.selected_symbol = config.SUPPORTED_SYMBOLS[0]
+        self.selected_symbol = config.MARKET_SYMBOLS[0]
         self.generation = 0
-        self.pending: queue.Queue = queue.Queue(maxsize=5)
+        self.pending: queue.Queue = queue.Queue(maxsize=max(5, len(config.MARKET_SYMBOLS) * 10))
+        self.queued: set[tuple[str, str, str]] = set()
         self.client = None
         self.stock_data = None
         self.option_data = None
@@ -97,10 +100,25 @@ class PaperTrader:
         self.broker_status = "starting"
         self.broker_error: str | None = None
         self.synced_at = 0.0
+        self.option_scans: dict[str, dict[str, Any]] = {
+            s: {"status": "idle"} for s in config.OPTION_UNDERLYINGS
+        }
+        self.monitor_error: str | None = None
+        self.chart_requests: dict[str, float] = {}
         self.started = False
         db.init_db()
         self.orders = {o["client_order_id"]: o for o in db.get_orders()}
         self.exits = db.get_exits()
+        self.instruments.update(
+            {o["symbol"]: o["instrument"] for o in self.orders.values() if o.get("instrument")}
+        )
+        self.instruments.update(
+            {
+                s: target["instrument"]
+                for s, target in self.exits.items()
+                if target.get("instrument")
+            }
+        )
 
     def start(self) -> None:
         if self.started:
@@ -114,35 +132,64 @@ class PaperTrader:
         self.client = TradingClient(key, secret, paper=True)
         self.stock_data = StockHistoricalDataClient(key, secret)
         self.option_data = OptionHistoricalDataClient(key, secret)
-        for symbol in config.SUPPORTED_SYMBOLS:
-            if symbol in config.OPTION_SYMBOLS:
-                contract = cast(OptionContract, self.client.get_option_contract(symbol))
-                self.instruments[symbol] = {
-                    "asset_class": "us_option",
-                    "multiplier": positive(contract.size, "Contract size"),
-                    "tradable": contract.tradable and contract.status == AssetStatus.ACTIVE,
-                    "fractionable": False,
-                    "expiration": str(contract.expiration_date),
-                }
-            else:
-                asset = cast(Asset, self.client.get_asset(symbol))
-                self.instruments[symbol] = {
-                    "asset_class": "us_equity",
-                    "multiplier": 1,
-                    "tradable": asset.tradable and asset.status == AssetStatus.ACTIVE,
-                    "fractionable": asset.fractionable,
-                    "expiration": None,
-                }
+        for symbol in config.MARKET_SYMBOLS:
+            asset = cast(Asset, self.client.get_asset(symbol))
+            self.instruments[symbol] = {
+                "asset_class": "us_equity",
+                "multiplier": 1,
+                "tradable": asset.tradable and asset.status == AssetStatus.ACTIVE,
+                "fractionable": asset.fractionable,
+                "expiration": None,
+            }
+
+    def is_option(self, symbol: str) -> bool:
+        return (
+            self.instruments.get(symbol, self.positions.get(symbol, {})).get("asset_class")
+            == "us_option"
+        )
+
+    def symbols(self) -> tuple[str, ...]:
+        with self.lock:
+            candidates = [
+                c["symbol"]
+                for scan in self.option_scans.values()
+                for c in scan.get("candidates", [])
+            ]
+            pending = [o["symbol"] for o in self.orders.values() if o["status"] not in TERMINAL]
+            viewed = [
+                s for s, requested in self.chart_requests.items() if time.time() - requested <= 30
+            ]
+            selected = [self.selected_symbol] if self.selected_symbol in self.instruments else []
+            return tuple(
+                dict.fromkeys(
+                    [
+                        *config.MARKET_SYMBOLS,
+                        *candidates,
+                        *self.positions,
+                        *pending,
+                        *viewed,
+                        *selected,
+                    ]
+                )
+            )
+
+    def _register_option(self, symbol: str) -> None:
+        if self.client is None:
+            raise ValueError("Alpaca paper client is unavailable")
+        self.instruments[symbol] = options.option_instrument(
+            cast(OptionContract, self.client.get_option_contract(symbol))
+        )
 
     def _poll(self) -> None:
         while True:
             try:
                 with self.lock:
-                    if self.client is None or len(self.instruments) != len(
-                        config.SUPPORTED_SYMBOLS
+                    if self.client is None or any(
+                        s not in self.instruments for s in config.MARKET_SYMBOLS
                     ):
                         self._connect()
                     self.refresh()
+                    self.monitor_options()
             except Exception as error:
                 with self.lock:
                     self.broker_status = "unavailable"
@@ -171,16 +218,32 @@ class PaperTrader:
             ),
             "status": order.status.value,
             "timestamp": (order.filled_at or order.submitted_at or order.created_at).timestamp(),
+            "instrument": self.instruments.get(order.symbol, previous.get("instrument", {})),
+            "submitted_at": previous.get(
+                "submitted_at", (order.submitted_at or order.created_at).timestamp()
+            ),
         }
         # Attach exit targets only to an actual (possibly partial) buy fill.
         if (
             record["side"] == "buy"
             and record["filled_qty"] > 0
             and "targets" in previous
-            and not previous.get("targets_applied")
+            and (
+                not previous.get("targets_applied")
+                or (
+                    previous.get("source") == "jev-options"
+                    and previous.get("price") != record["price"]
+                    and self.exits.get(order.symbol, {}).get("tp_sl_source") == "jev-options"
+                )
+            )
         ):
-            self.exits[order.symbol] = previous["targets"]
-            db.save_exits(order.symbol, previous["targets"])
+            targets = {**self.exits.get(order.symbol, {}), **previous["targets"]}
+            if previous.get("source") == "jev-options":
+                entry = positive(record["price"], "Fill price")
+                targets["stop_loss_price"] = entry * (1 - targets["premium_stop_pct"] / 100)
+                targets["take_profit_price"] = entry * (1 + targets["premium_take_pct"] / 100)
+            self.exits[order.symbol] = targets
+            db.save_exits(order.symbol, targets)
             record["targets_applied"] = True
         self.orders[order.client_order_id] = record
         db.save_order(record)
@@ -201,6 +264,13 @@ class PaperTrader:
         )
         seen = set()
         for broker_order in broker_orders:
+            if (
+                getattr(broker_order, "asset_class", None) == "us_option"
+                and broker_order.status.value not in TERMINAL
+                and broker_order.symbol is not None
+                and broker_order.symbol not in self.instruments
+            ):
+                self._register_option(broker_order.symbol)
             seen.add(broker_order.client_order_id)
             self._record_order(broker_order)
         for client_id, order in list(self.orders.items()):
@@ -213,6 +283,8 @@ class PaperTrader:
                     # An ambiguous submission is not safe to repeat, even after a 404.
         positions = {}
         for p in cast(list[Position], self.client.get_all_positions()):
+            if p.asset_class.value == "us_option" and p.symbol not in self.instruments:
+                self._register_option(p.symbol)
             entry = float(p.avg_entry_price)
             targets = self.exits.get(p.symbol, {})
             multiplier = self.instruments.get(p.symbol, {}).get(
@@ -230,6 +302,8 @@ class PaperTrader:
                 "asset_class": p.asset_class.value,
                 "multiplier": multiplier,
                 "position": "Long" if float(p.qty) > 0 else "Short",
+                "underlying": self.instruments.get(p.symbol, {}).get("underlying"),
+                "expiration": self.instruments.get(p.symbol, {}).get("expiration"),
                 **targets,
                 "stop_loss_pct": (1 - targets["stop_loss_price"] / entry) * 100
                 if targets.get("stop_loss_price")
@@ -240,6 +314,20 @@ class PaperTrader:
             }
         for symbol in list(self.exits):
             if symbol not in positions and not self._open_orders(symbol):
+                expiration = self.instruments.get(symbol, {}).get("expiration")
+                if (
+                    expiration
+                    and expiration <= datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+                ):
+                    self._log_event(
+                        {
+                            "timestamp": time.time(),
+                            "action": "expiry_reconciliation",
+                            "executed": "hold",
+                            "confidence": None,
+                            "reason": f"{symbol} is no longer held at Alpaca; inspect account for exercise or delivery effects.",
+                        }
+                    )
                 db.delete_exits(symbol)
                 del self.exits[symbol]
         self.positions = positions
@@ -275,7 +363,7 @@ class PaperTrader:
 
     def set_enabled(self, enabled: bool, symbol: str) -> None:
         with self.lock:
-            if symbol not in config.SUPPORTED_SYMBOLS:
+            if symbol not in self.symbols():
                 raise ValueError("Symbol is not configured")
             if enabled:
                 self._ready()
@@ -328,8 +416,13 @@ class PaperTrader:
                     "positions": trades[:100],
                     "orders": orders[:100],
                     "agent_enabled": bool(self.api_key),
+                    "stock_symbol": self.selected_symbol
+                    if self.selected_symbol in config.STOCK_SYMBOLS
+                    else None,
                     "broker_status": self.broker_status,
                     "broker_error": self.broker_error,
+                    "option_scans": self.option_scans,
+                    "monitor_error": self.monitor_error,
                 }
             )
 
@@ -362,7 +455,7 @@ class PaperTrader:
         ]
 
     def _quote(self, symbol: str, side: str) -> float:
-        if symbol in config.OPTION_SYMBOLS:
+        if self.is_option(symbol):
             if self.option_data is None:
                 raise ValueError("Option data client is unavailable")
             quotes = self.option_data.get_option_latest_quote(
@@ -435,9 +528,52 @@ class PaperTrader:
             self.starting_cash - exposure - reserved,
             per_symbol,
         )
-        if symbol in config.OPTION_SYMBOLS:
+        if self.is_option(symbol):
             capacity = min(capacity, self.account["options_buying_power"])
         return max(0, capacity)
+
+    def _option_capacity(self, underlying: str, symbol: str | None = None) -> float:
+        capital = min(self.starting_cash, self.account["equity"])
+        option_exposure = underlying_exposure = 0.0
+        for ticker, position in self.positions.items():
+            instrument = self.instruments.get(ticker, {})
+            exposure = max(0, position["market_value"])
+            if self.is_option(ticker):
+                if not instrument.get("underlying") or position["quantity"] < 0:
+                    return 0.0
+                option_exposure += exposure
+                # One long option position per underlying; no pyramiding or synthetic spreads.
+                if instrument["underlying"] == underlying and position["quantity"] > 0:
+                    return 0.0
+            if ticker == underlying or instrument.get("underlying") == underlying:
+                underlying_exposure += exposure
+        for order in self.orders.values():
+            if order["side"] != "buy" or order["status"] in TERMINAL:
+                continue
+            ticker = order["symbol"]
+            instrument = self.instruments.get(ticker) or order.get("instrument") or {}
+            reserved = (
+                max(0, order["quantity"] - order["filled_qty"])
+                * order["estimated_price"]
+                * order["multiplier"]
+            )
+            if self.is_option(ticker) or order["multiplier"] != 1:
+                if not instrument.get("underlying") or instrument["underlying"] == underlying:
+                    return 0.0
+                option_exposure += reserved
+            if ticker == underlying or instrument.get("underlying") == underlying:
+                underlying_exposure += reserved
+        risk = {"conservative": 0.5, "balanced": 0.75, "aggressive": 1.0}[self.risk_appetite]
+        return max(
+            0.0,
+            min(
+                self._buying_capacity(symbol or underlying),
+                self.account["options_buying_power"],
+                capital * config.OPTIONS.max_trade_pct * risk,
+                capital * config.OPTIONS.max_underlying_pct - underlying_exposure,
+                capital * config.OPTIONS.max_total_pct - option_exposure,
+            ),
+        )
 
     def _order(
         self,
@@ -449,24 +585,43 @@ class PaperTrader:
         limit_price=None,
         source="manual",
         targets=None,
+        expected_price=None,
     ) -> dict[str, Any]:
         with self.lock:
             self._ready()
-            if symbol not in config.SUPPORTED_SYMBOLS:
-                raise ValueError("Symbol is not configured")
+            if symbol not in self.instruments:
+                raise ValueError("Symbol has no verified instrument metadata")
             self.refresh()
             client = self._ready()
             if self._open_orders(symbol):
                 raise ValueError("An open or unresolved order already exists for this symbol")
             instrument = self.instruments[symbol]
-            if not instrument["tradable"]:
+            if side == "buy" and not instrument["tradable"]:
                 raise ValueError("Asset is not tradable")
             if not cast(Clock, client.get_clock()).is_open:
                 raise ValueError("Regular market session is closed")
-            option = symbol in config.OPTION_SYMBOLS
-            if option and side == "buy" and self.account["options_trading_level"] < 2:
-                raise ValueError("Long options require Alpaca options trading level 2")
-            quote = self._quote(symbol, side)
+            option = self.is_option(symbol)
+            candidate = None
+            if option and side == "buy":
+                underlying = instrument.get("underlying")
+                if underlying not in config.OPTION_UNDERLYINGS:
+                    raise ValueError("Option underlying is not in the entry watchlist")
+                if self.account["options_trading_level"] < 2:
+                    raise ValueError("Long options require Alpaca options trading level 2")
+                if self.option_data is None:
+                    raise ValueError("Option data client is unavailable")
+                candidate = options.validate_candidate(
+                    client,
+                    self.option_data,
+                    symbol,
+                    underlying,
+                    self._option_capacity(underlying, symbol),
+                    expected_price=expected_price,
+                )
+                self.instruments[symbol] = instrument = candidate
+            elif side == "buy" and symbol not in config.STOCK_SYMBOLS:
+                raise ValueError("Stock is not in the stock-entry watchlist")
+            quote = candidate["limit_price"] if candidate else self._quote(symbol, side)
             limit = (
                 positive(limit_price, "Limit price")
                 if limit_price is not None
@@ -486,7 +641,11 @@ class PaperTrader:
             if side == "buy":
                 if quantity is not None and amount_usd is not None:
                     raise ValueError("Specify quantity or amount_usd, not both")
-                available = self._buying_capacity(symbol)
+                available = (
+                    self._option_capacity(instrument["underlying"], symbol)
+                    if option
+                    else self._buying_capacity(symbol)
+                )
                 allocation = (
                     positive(amount_usd, "Amount") if amount_usd is not None else available * 0.5
                 )
@@ -495,6 +654,10 @@ class PaperTrader:
                         raise ValueError("Amount exceeds available cash or position budget")
                     quantity = rounded_quantity(
                         allocation / (price * multiplier), option or not instrument["fractionable"]
+                    )
+                if candidate and quantity > candidate["max_quantity"]:
+                    raise ValueError(
+                        "Quantity exceeds option risk budget, contract cap, or available quote depth"
                     )
                 if quantity * price * multiplier > available + 1e-8:
                     raise ValueError("Order exceeds available cash or position budget")
@@ -539,6 +702,8 @@ class PaperTrader:
                 "source": source,
                 "estimated_price": price,
                 "multiplier": multiplier,
+                "instrument": instrument,
+                "submitted_at": time.time(),
             }
             if targets is not None and side == "buy":
                 intent["targets"] = targets
@@ -572,7 +737,9 @@ class PaperTrader:
     ):
         with self.lock:
             targets = self._targets(
-                positive(price, "Reference price"),
+                self._quote(symbol, "buy")
+                if price is None and self.is_option(symbol)
+                else positive(price, "Reference price"),
                 stop_loss_pct,
                 stop_loss_price,
                 take_profit_pct,
@@ -616,7 +783,12 @@ class PaperTrader:
     def cancel_order(self, order_id: str) -> dict[str, Any]:
         with self.lock:
             client = self._ready()
-            client.cancel_order_by_id(order_id)
+            record = next((o for o in self.orders.values() if o.get("id") == order_id), None)
+            if record is None or not record.get("cancel_requested_at"):
+                client.cancel_order_by_id(order_id)
+                if record is not None:
+                    record["cancel_requested_at"] = time.time()
+                    db.save_order(record)
             return {"id": order_id, "status": "cancel_requested"}
 
     def update_tp_sl(
@@ -651,7 +823,7 @@ class PaperTrader:
                     values[kind + "_price"] = None
                     if value:
                         values[kind + ("_price" if absolute is not None else "_pct")] = value
-            targets = self._targets(position["average_entry_price"], **values)
+            targets = {**old, **self._targets(position["average_entry_price"], **values)}
             db.save_exits(symbol, targets)
             self.exits[symbol] = targets
             self.positions[symbol].update(targets)
@@ -659,7 +831,7 @@ class PaperTrader:
 
     def check_tp_sl(self, symbol, current_price, timeframe="1m"):
         with self.lock:
-            if symbol not in config.SUPPORTED_SYMBOLS or symbol not in self.positions:
+            if symbol not in self.positions:
                 return None
             targets = self.exits.get(symbol, {})
             sl, tp = targets.get("stop_loss_price"), targets.get("take_profit_price")
@@ -677,6 +849,8 @@ class PaperTrader:
                 if (reason == "stop_loss" and sl is not None and bid <= sl) or (
                     reason == "take_profit" and tp is not None and bid >= tp
                 ):
+                    if self.is_option(symbol):
+                        return self._drive_option_exit(symbol, reason)
                     pending = self._open_orders(symbol)
                     if pending:
                         for order in pending:
@@ -690,23 +864,239 @@ class PaperTrader:
                     return self.manual_sell(symbol, bid, source=reason)
         return None
 
-    def submit(self, state: dict[str, Any]) -> None:
-        with self.lock:
+    def _drive_option_exit(self, symbol: str, reason: str) -> dict[str, Any] | None:
+        targets = self.exits.setdefault(symbol, {})
+        if not targets.get("exit_reason"):
+            targets.update(
+                exit_reason=reason,
+                exit_requested_at=time.time(),
+                instrument=self.instruments[symbol],
+            )
+            db.save_exits(symbol, targets)
+        self.positions[symbol].update(targets)
+        pending = self._open_orders(symbol)
+        for order in pending:
+            if not order.get("source"):
+                raise ValueError(
+                    "Unmanaged open order prevents automated exit; reconcile it at Alpaca"
+                )
+            if not order.get("id"):
+                raise ValueError("Unresolved order outcome prevents another exit submission")
             if (
-                not state
-                or not self.enabled
-                or state["symbol"] != self.selected_symbol
-                or not self.api_key
+                order["side"] == "buy"
+                or time.time() - order["submitted_at"] >= config.OPTIONS.exit_reprice_seconds
+            ):
+                self.cancel_order(order["id"])
+        if pending:
+            return None  # Cancellation acknowledgement is not cancellation confirmation.
+        return self._order(symbol, "sell", source=targets["exit_reason"])
+
+    def monitor_options(self) -> None:
+        """Manage owned option positions even when automation is paused or the watchlist changes."""
+        errors = []
+        today = datetime.now(ZoneInfo("America/New_York")).date()
+        for order in list(self.orders.values()):
+            if (
+                order.get("source") != "jev-options"
+                or order["side"] != "buy"
+                or order["status"] in TERMINAL
+            ):
+                continue
+            if time.time() - order["submitted_at"] >= config.OPTIONS.entry_timeout_seconds:
+                try:
+                    if not order.get("id"):
+                        raise ValueError(
+                            "Unresolved entry outcome; reservation retained until broker reconciliation"
+                        )
+                    self.cancel_order(order["id"])
+                except Exception as error:
+                    errors.append(f"{order['symbol']}: {error}")
+        for symbol, position in list(self.positions.items()):
+            if not self.is_option(symbol) or position["quantity"] <= 0:
+                continue
+            if symbol not in self.exits:
+                continue  # Broker-held positions outside this strategy are not silently liquidated.
+            try:
+                expiration = date.fromisoformat(self.instruments[symbol]["expiration"])
+                if expiration < today:
+                    raise ValueError(
+                        "Expired position remains at broker; awaiting expiry/exercise reconciliation"
+                    )
+                targets = self.exits[symbol]
+                reason = targets.get("exit_reason")
+                if (expiration - today).days <= config.OPTIONS.exit_dte:
+                    reason = reason or "near_expiry"
+                if not reason:
+                    bid = self._quote(symbol, "sell")
+                    sl, tp = targets.get("stop_loss_price"), targets.get("take_profit_price")
+                    reason = (
+                        "stop_loss"
+                        if sl and bid <= sl
+                        else "take_profit"
+                        if tp and bid >= tp
+                        else None
+                    )
+                if reason:
+                    self._drive_option_exit(symbol, reason)
+            except Exception as error:
+                errors.append(f"{symbol}: {error}")
+        self.monitor_error = "; ".join(errors) or None
+
+    @staticmethod
+    def _fresh_underlying(state: dict[str, Any]) -> None:
+        now = time.time()
+        quote_time, bar_time = state.get("quote_time"), state.get("bar_time")
+        if quote_time is None or not -5 <= now - quote_time <= 30:
+            raise ValueError("Underlying quote is stale or unavailable")
+        if bar_time is None or not 0 <= now - bar_time <= 180:
+            raise ValueError("Underlying completed bars are stale or unavailable")
+
+    def _prepare_options(self, state: dict[str, Any]) -> dict[str, Any]:
+        underlying = state["symbol"]
+        self._fresh_underlying(state)
+        with self.lock:
+            client = self._ready()
+            self.refresh()
+            if self.option_data is None:
+                raise ValueError("Option data client is unavailable")
+            if not cast(Clock, client.get_clock()).is_open:
+                raise ValueError("Regular market session is closed")
+            budget = self._option_capacity(underlying)
+            held = [
+                dict(p)
+                for s, p in self.positions.items()
+                if self.is_option(s)
+                and p.get("underlying") == underlying
+                and p["quantity"] > 0
+                and s in self.exits
+            ]
+            self.option_scans[underlying] = {"status": "scanning", "as_of": time.time()}
+        try:
+            scan = (
+                options.discover_candidates(client, self.option_data, underlying, budget)
+                if budget > 0
+                else {
+                    "candidates": [],
+                    "discovered": 0,
+                    "eligible": 0,
+                    "rejections": {},
+                    "as_of": time.time(),
+                    "reason": "Existing exposure or premium budget prevents another entry",
+                }
+            )
+            scan["status"] = "ready" if scan["candidates"] else "no eligible contracts"
+        except Exception as error:
+            scan = {
+                "status": "blocked",
+                "error": str(error),
+                "candidates": [],
+                "as_of": time.time(),
+            }
+        with self.lock:
+            self.option_scans[underlying] = scan
+            for candidate in scan["candidates"]:
+                self.instruments[candidate["symbol"]] = candidate
+            supported = set(self.symbols())
+            for symbol in list(self.instruments):
+                if symbol not in supported:
+                    del self.instruments[symbol]
+        return {
+            **state,
+            "candidates": scan["candidates"],
+            "option_positions": held,
+            "option_budget": budget,
+            "option_policy": config.OPTIONS.model_dump(),
+            "option_feed": config.OPTION_FEED.value,
+            "scan_reason": scan.get("error", scan.get("reason", "No eligible option contracts")),
+        }
+
+    def _apply_option_decision(
+        self, state: dict[str, Any], response: dict[str, Any]
+    ) -> dict[str, Any]:
+        answer = response.get("answers", {}).get("option_action", {})
+        choice = answer.get("choice", "hold")
+        permitted = option_questions(state)["option_action"]["criteria"]
+        if choice not in permitted:
+            raise ValueError("Agent selected an option action outside the verified shortlist")
+        confidence = answer.get("confidence", 0)
+        if (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not math.isfinite(confidence)
+            or not 0 <= confidence <= 1
+        ):
+            raise ValueError("Invalid agent confidence")
+        event = {
+            "timestamp": time.time(),
+            "symbol": state["symbol"],
+            "action": choice,
+            "confidence": confidence,
+            "executed": "hold",
+            "request": state,
+            "response": response,
+        }
+        threshold = {"conservative": 0.75, "balanced": 0.6, "aggressive": 0.5}[self.risk_appetite]
+        if choice == "hold" or confidence < threshold:
+            return event
+        self._fresh_underlying(state)
+        action, symbol = choice.split(":", 1)
+        if action == "buy":
+            candidate = next(c for c in state["candidates"] if c["symbol"] == symbol)
+            targets = {
+                "premium_stop_pct": config.OPTIONS.stop_loss_pct,
+                "premium_take_pct": config.OPTIONS.take_profit_pct,
+                "tp_sl_source": "jev-options",
+            }
+            order = self._order(
+                symbol,
+                "buy",
+                quantity=candidate["max_quantity"],
+                source="jev-options",
+                targets=targets,
+                expected_price=candidate["limit_price"],
+            )
+        else:
+            self.refresh()
+            if symbol not in self.positions or self.positions[symbol]["quantity"] <= 0:
+                return event
+            order = self._drive_option_exit(symbol, "agent_exit")
+        event.update(executed="submitted" if order else "exit_pending", trade=order)
+        return event
+
+    def _log_event(self, event: dict[str, Any]) -> None:
+        db.log_decision(event)
+        with self.lock:
+            self.recent_logs = (self.recent_logs + [event])[-15:]
+
+    def submit(self, state: dict[str, Any], strategy: str = "stock") -> None:
+        with self.lock:
+            if not state or not self.enabled or not self.api_key:
+                return
+            symbol = state["symbol"]
+            if strategy == "options":
+                if symbol not in config.OPTION_UNDERLYINGS:
+                    return
+            elif (
+                strategy != "stock"
+                or symbol != self.selected_symbol
+                or symbol not in config.STOCK_SYMBOLS
             ):
                 return
+            key = (strategy, symbol, state.get("time_frame", "1m"))
+            if key in self.queued:
+                return
             try:
-                self.pending.put_nowait((self.generation, time.time(), deepcopy(state)))
+                self.pending.put_nowait(
+                    (self.generation, time.time(), {**deepcopy(state), "strategy": strategy})
+                )
+                self.queued.add(key)
             except queue.Full:
                 pass
 
     def _run(self) -> None:
         while True:
             generation, submitted_at, state = self.pending.get()
+            key = (state["strategy"], state["symbol"], state.get("time_frame", "1m"))
             try:
                 with self.lock:
                     if (
@@ -715,14 +1105,36 @@ class PaperTrader:
                         or time.time() - submitted_at > 120
                     ):
                         continue
-                body = json.dumps(
-                    {"state": state, "model": "jev-latest", "questions": Questions}
-                ).encode()
+                if state["strategy"] == "options":
+                    state = self._prepare_options(state)
+                    if not state["candidates"] and not state["option_positions"]:
+                        self._log_event(
+                            {
+                                "timestamp": time.time(),
+                                "symbol": state["symbol"],
+                                "action": "hold",
+                                "executed": "hold",
+                                "confidence": None,
+                                "reason": state["scan_reason"],
+                            }
+                        )
+                        continue
+                questions = option_questions(state) if state["strategy"] == "options" else Questions
+                with self.lock:
+                    if (
+                        generation != self.generation
+                        or not self.enabled
+                        or time.time() - submitted_at > 120
+                    ):
+                        continue
+                    api_key = self.api_key
                 request = urllib.request.Request(
                     TYPESAFE_URL,
-                    data=body,
+                    data=json.dumps(
+                        {"state": state, "model": "jev-latest", "questions": questions}
+                    ).encode(),
                     headers={
-                        "Authorization": f"Bearer {self.api_key}",
+                        "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json",
                     },
                     method="POST",
@@ -736,22 +1148,33 @@ class PaperTrader:
                         or time.time() - submitted_at > 120
                     ):
                         continue
-                    event = self._apply_decision(state, result)
+                    self._log_event(self._apply_decision(state, result))
             except Exception as error:
-                event = {
-                    "timestamp": time.time(),
-                    "action": "error",
-                    "executed": "hold",
-                    "confidence": None,
-                    "error": str(error),
-                }
+                if state["strategy"] == "options":
+                    with self.lock:
+                        self.option_scans[state["symbol"]] = {
+                            **self.option_scans.get(state["symbol"], {}),
+                            "status": "blocked",
+                            "error": str(error),
+                        }
+                self._log_event(
+                    {
+                        "timestamp": time.time(),
+                        "symbol": state["symbol"],
+                        "action": "error",
+                        "executed": "hold",
+                        "confidence": None,
+                        "error": str(error),
+                    }
+                )
             finally:
+                with self.lock:
+                    self.queued.discard(key)
                 self.pending.task_done()
-            db.log_decision(event)
-            with self.lock:
-                self.recent_logs = (self.recent_logs + [event])[-15:]
 
     def _apply_decision(self, state: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
+        if state.get("strategy") == "options":
+            return self._apply_option_decision(state, response)
         self._ready()
         answers = response.get("answers", {})
         answer = answers.get("action_choice", {})

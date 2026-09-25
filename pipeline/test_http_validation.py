@@ -68,7 +68,7 @@ class HttpValidation(unittest.TestCase):
                             self.assertFalse(feed.TRADER.enabled)
                     status, response = post(
                         "/order",
-                        {"action": "buy", "symbol": config.SUPPORTED_SYMBOLS[0], "quantity": True},
+                        {"action": "buy", "symbol": config.MARKET_SYMBOLS[0], "quantity": True},
                     )
                     self.assertEqual(status, 400)
                     self.assertIn("quantity", response["error"])

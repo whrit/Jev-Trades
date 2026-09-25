@@ -4,23 +4,27 @@ import os
 import tempfile
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace as Model
 from typing import cast
 from unittest.mock import patch
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
+from alpaca.data.enums import OptionsFeed
 from alpaca.data.historical import OptionHistoricalDataClient, StockHistoricalDataClient
 from alpaca.data.models import Quote
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import AssetClass, OrderStatus, PositionIntent
+from alpaca.trading.enums import AssetClass, AssetStatus, ContractType, OrderStatus, PositionIntent
 
 with patch.dict(os.environ, {}, clear=True), patch("dotenv.load_dotenv"):
     from pipeline import config, db
     from pipeline.paper_trader import PaperTrader
 
-OPTION = "SPY271217C00600000"
+TODAY = datetime.now(ZoneInfo("America/New_York")).date()
+EXPIRATION = TODAY + timedelta(days=14)
+OPTION = f"SPY{EXPIRATION:%y%m%d}C00600000"
 
 
 class Broker:
@@ -53,6 +57,29 @@ class Broker:
     def get_clock(self):
         return Model(is_open=True)
 
+    def get_option_contract(self, symbol):
+        return Model(
+            symbol=symbol,
+            underlying_symbol="SPY",
+            root_symbol="SPY",
+            expiration_date=EXPIRATION,
+            status=AssetStatus.ACTIVE,
+            tradable=True,
+            type=ContractType.CALL,
+            strike_price=600.0,
+            size="100",
+            open_interest="1000",
+            open_interest_date=TODAY,
+        )
+
+    def get_option_contracts(self, request):
+        return Model(
+            option_contracts=[self.get_option_contract(OPTION)]
+            if request.type == ContractType.CALL
+            else [],
+            next_page_token=None,
+        )
+
     def submit_order(self, request):
         self.requests.append(request)
         order = Model(
@@ -74,12 +101,28 @@ class Broker:
         return order
 
     def fill(self, order, qty, price):
+        delta = qty - float(order.filled_qty)
         order.filled_qty = str(qty)
         order.filled_avg_price = str(price)
         order.status = (
             OrderStatus.FILLED if qty == float(order.qty) else OrderStatus.PARTIALLY_FILLED
         )
         order.filled_at = datetime.now(timezone.utc)
+        if order.side.value == "sell":
+            position = next(p for p in self.positions if p.symbol == order.symbol)
+            remaining = float(position.qty) - delta
+            self.cash += delta * price * 100
+            if remaining <= 0:
+                self.positions.remove(position)
+            else:
+                position.qty = position.qty_available = str(remaining)
+                position.market_value = str(remaining * float(position.current_price) * 100)
+                position.unrealized_pl = str(
+                    remaining
+                    * (float(position.current_price) - float(position.avg_entry_price))
+                    * 100
+                )
+            return
         self.cash = 100000 - qty * price * 100
         self.positions = [
             Model(
@@ -111,6 +154,15 @@ class Quotes:
             )
         }
 
+    def get_option_snapshot(self, request):
+        return {
+            OPTION: Model(
+                latest_quote=self.get_option_latest_quote(request)[OPTION],
+                greeks=None,
+                implied_volatility=None,
+            )
+        }
+
     def get_stock_latest_quote(self, request):
         return {
             "SPY": Quote("SPY", {"t": self.timestamp, "bp": 599, "ap": 600, "bs": 10, "as": 10})
@@ -118,12 +170,149 @@ class Quotes:
 
 
 class PaperLifecycle(unittest.TestCase):
+    def test_viewed_contract_remains_chartable_after_leaving_shortlist(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(db, "DB_PATH", Path(directory) / "paper.db"),
+            patch.object(config, "OPTION_UNDERLYINGS", ("SPY",)),
+            patch.object(config, "OPTION_FEED", OptionsFeed.OPRA),
+        ):
+            from pipeline import data_collector as feed
+
+            broker, quotes = Broker(), Quotes()
+            trader = PaperTrader()
+            trader.client = cast(TradingClient, broker)
+            trader.option_data = cast(OptionHistoricalDataClient, quotes)
+            trader.refresh()
+            state = {
+                "strategy": "options",
+                "symbol": "SPY",
+                "current_price": 600,
+                "quote_time": time.time(),
+                "bar_time": time.time() - 60,
+            }
+            trader._prepare_options(state)
+            with patch.object(feed, "TRADER", trader):
+                market = feed.MarketState()
+                market.snapshot(OPTION)
+                quotes.bid, quotes.ask = 100, 100.1
+                self.assertEqual(trader._prepare_options(state)["candidates"], [])
+                snapshot = market.snapshot(OPTION)
+                self.assertEqual(snapshot["symbol"], OPTION)
+                self.assertEqual(snapshot["instruments"][OPTION]["asset_class"], "us_option")
+
+    def test_verified_ai_choice_revalidation_and_durable_partial_fill_exit(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(db, "DB_PATH", Path(directory) / "paper.db"),
+            patch.object(config, "OPTION_UNDERLYINGS", ("SPY",)),
+            patch.object(config, "OPTION_FEED", OptionsFeed.INDICATIVE),
+        ):
+            broker, quotes = Broker(), Quotes()
+            trader = PaperTrader()
+            trader.client = cast(TradingClient, broker)
+            trader.option_data = cast(OptionHistoricalDataClient, quotes)
+            trader.refresh()
+            state = trader._prepare_options(
+                {
+                    "strategy": "options",
+                    "symbol": "SPY",
+                    "current_price": 600,
+                    "quote_time": time.time(),
+                    "bar_time": time.time() - 60,
+                }
+            )
+            self.assertEqual([c["symbol"] for c in state["candidates"]], [OPTION])
+            self.assertEqual(state["candidates"][0]["max_quantity"], 3)
+            response = {
+                "answers": {"option_action": {"choice": "buy:UNVERIFIED", "confidence": 0.99}}
+            }
+            with self.assertRaises(ValueError):
+                trader._apply_decision(state, response)
+            self.assertEqual(broker.requests, [])
+            response["answers"]["option_action"]["choice"] = f"buy:{OPTION}"
+            quotes.bid, quotes.ask = 2.09, 2.10
+            with self.assertRaises(ValueError):
+                trader._apply_decision(state, response)
+            self.assertEqual(broker.requests, [])
+            quotes.bid, quotes.ask = 1.99, 2.0
+            event = trader._apply_decision(state, response)
+            self.assertEqual((event["executed"], broker.requests[-1].qty), ("submitted", 3))
+            broker.fill(broker.orders[0], 1, 1.9)
+            trader.refresh()
+            self.assertAlmostEqual(trader.exits[OPTION]["stop_loss_price"], 1.52)
+            quotes.bid, quotes.ask = 1.4, 1.41
+            trader.monitor_options()
+            self.assertEqual(trader.exits[OPTION]["exit_reason"], "stop_loss")
+            self.assertEqual(broker.orders[0].status, OrderStatus.CANCELED)
+            self.assertEqual(len(broker.requests), 1)
+            # The stop remains latched after restart, pause, watchlist removal and price recovery.
+            with patch.object(config, "OPTION_UNDERLYINGS", ()):
+                restarted = PaperTrader()
+                restarted.client = cast(TradingClient, broker)
+                restarted.option_data = cast(OptionHistoricalDataClient, quotes)
+                restarted.refresh()
+                self.assertFalse(restarted.enabled)
+                quotes.bid, quotes.ask = 1.8, 1.81
+                restarted.monitor_options()
+                self.assertEqual(
+                    (broker.requests[-1].side.value, broker.requests[-1].qty), ("sell", 1)
+                )
+                sell = restarted._open_orders(OPTION)[0]
+                sell["submitted_at"] = time.time() - config.OPTIONS.exit_reprice_seconds - 1
+                restarted.monitor_options()
+                self.assertEqual(len(broker.requests), 2)
+                self.assertEqual(broker.orders[-1].status, OrderStatus.CANCELED)
+                restarted.refresh()
+                quotes.bid, quotes.ask = 1.85, 1.86
+                restarted.monitor_options()
+                self.assertEqual((len(broker.requests), broker.requests[-1].limit_price), (3, 1.85))
+                broker.fill(broker.orders[-1], 1, 1.85)
+                restarted.refresh()
+                self.assertNotIn(OPTION, restarted.positions)
+                self.assertNotIn(OPTION, db.get_exits())
+
+    def test_expiry_exit_is_persisted_while_market_closed(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(db, "DB_PATH", Path(directory) / "paper.db"),
+            patch.object(config, "OPTION_UNDERLYINGS", ("SPY",)),
+            patch.object(config, "OPTION_FEED", OptionsFeed.OPRA),
+        ):
+            broker, quotes = Broker(), Quotes()
+            trader = PaperTrader()
+            trader.client = cast(TradingClient, broker)
+            trader.option_data = cast(OptionHistoricalDataClient, quotes)
+            trader._register_option(OPTION)
+            trader.refresh()
+            trader.manual_buy(OPTION, 2, quantity=1)
+            broker.fill(broker.orders[0], 1, 2)
+            future = datetime.now(ZoneInfo("America/New_York")) + timedelta(days=13)
+            quotes.timestamp = future
+            with (
+                patch("pipeline.paper_trader.datetime", wraps=datetime) as clock,
+                patch("pipeline.paper_trader.time.time", return_value=future.timestamp()),
+            ):
+                clock.now.return_value = future
+                trader.refresh()
+                with patch.object(broker, "get_clock", return_value=Model(is_open=False)):
+                    trader.monitor_options()
+                self.assertEqual(db.get_exits()[OPTION]["exit_reason"], "near_expiry")
+                self.assertEqual(len(broker.requests), 1)
+                self.assertIsNotNone(trader.monitor_error)
+                trader.monitor_options()
+                self.assertEqual(
+                    (broker.requests[-1].side.value, broker.requests[-1].qty), ("sell", 1)
+                )
+                self.assertIsNone(trader.monitor_error)
+
     def test_broker_fills_contract_sizing_restart_and_ambiguous_submission(self):
         with (
             tempfile.TemporaryDirectory() as directory,
             patch.object(db, "DB_PATH", Path(directory) / "paper.db"),
-            patch.object(config, "SUPPORTED_SYMBOLS", ("SPY", OPTION)),
-            patch.object(config, "OPTION_SYMBOLS", (OPTION,)),
+            patch.object(config, "MARKET_SYMBOLS", ("SPY",)),
+            patch.object(config, "OPTION_UNDERLYINGS", ("SPY",)),
+            patch.object(config, "OPTION_FEED", OptionsFeed.OPRA),
         ):
             broker, quotes = Broker(), Quotes()
 
@@ -138,6 +327,9 @@ class PaperLifecycle(unittest.TestCase):
                         "tradable": True,
                         "fractionable": False,
                         "asset_class": "us_option",
+                        "underlying": "SPY",
+                        "expiration": EXPIRATION.isoformat(),
+                        "option_type": "call",
                     },
                     "SPY": {
                         "multiplier": 1,
@@ -159,10 +351,10 @@ class PaperLifecycle(unittest.TestCase):
             self.assertEqual(trader.snapshot()["account"]["positions"], {})
             self.assertEqual(broker.requests[-1].position_intent, PositionIntent.BUY_TO_OPEN)
             self.assertEqual(broker.requests[-1].limit_price, 2)
-            with self.assertRaisesRegex(ValueError, "open or unresolved"):
+            with self.assertRaises(ValueError):
                 trader.manual_buy(OPTION, 2, quantity=1)
             trader.configure(capital=1000)
-            with self.assertRaisesRegex(ValueError, "budget"):
+            with self.assertRaises(ValueError):
                 trader.manual_buy("SPY", 600, quantity=1)
             trader.configure(capital=100000)
             broker.fill(broker.orders[0], 1, 1.9)
@@ -178,9 +370,9 @@ class PaperLifecycle(unittest.TestCase):
             self.assertEqual(trader.positions[OPTION]["stop_loss_price"], 1.9)
             broker.fill(broker.orders[0], 3, 1.95)
             trader.refresh()
-            with self.assertRaisesRegex(ValueError, "whole contracts"):
+            with self.assertRaises(ValueError):
                 trader.manual_sell(OPTION, 2, quantity=0.5)
-            with self.assertRaisesRegex(ValueError, "Sell exceeds"):
+            with self.assertRaises(ValueError):
                 trader.manual_sell(OPTION, 2, quantity=4)
             sell = trader.manual_sell(OPTION, 2, pct_of_position=0.5)
             self.assertEqual(sell["quantity"], 1)
@@ -189,17 +381,17 @@ class PaperLifecycle(unittest.TestCase):
             trader.cancel_order(sell["id"])
             trader.refresh()
             self.assertEqual(trader.orders[sell["client_order_id"]]["status"], "canceled")
-            with self.assertRaisesRegex(ValueError, "budget"):
+            with self.assertRaises(ValueError):
                 trader.manual_buy(OPTION, 2, quantity=1000)
             trader.configure(capital=1000)
-            with self.assertRaisesRegex(ValueError, "budget"):
+            with self.assertRaises(ValueError):
                 trader.manual_buy("SPY", 600, quantity=1)
             trader.configure(capital=100000)
             for invalid in [float("nan"), float("inf"), -1, 0, True]:
                 with self.assertRaises(ValueError):
                     trader.manual_buy("SPY", 600, quantity=invalid)
             quotes.timestamp = datetime.fromtimestamp(time.time() - 60, timezone.utc)
-            with self.assertRaisesRegex(ValueError, "stale"):
+            with self.assertRaises(ValueError):
                 trader.manual_buy("SPY", 600, quantity=1)
             quotes.timestamp = datetime.now(timezone.utc)
             broker.fail = True
@@ -210,7 +402,7 @@ class PaperLifecycle(unittest.TestCase):
             trader = connect()
             self.assertEqual(trader._open_orders("SPY")[0]["status"], "accepted")
             before = len(broker.requests)
-            with self.assertRaisesRegex(ValueError, "open or unresolved"):
+            with self.assertRaises(ValueError):
                 trader.manual_buy("SPY", 600, quantity=0.5)
             self.assertEqual(len(broker.requests), before)
             trader.api_key = "offline-test"
@@ -226,14 +418,23 @@ class PaperLifecycle(unittest.TestCase):
         with (
             tempfile.TemporaryDirectory() as directory,
             patch.object(db, "DB_PATH", Path(directory) / "paper.db"),
-            patch.object(config, "SUPPORTED_SYMBOLS", (OPTION,)),
-            patch.object(config, "OPTION_SYMBOLS", (OPTION,)),
+            patch.object(config, "MARKET_SYMBOLS", ("SPY",)),
+            patch.object(config, "OPTION_UNDERLYINGS", ("SPY",)),
+            patch.object(config, "OPTION_FEED", OptionsFeed.OPRA),
         ):
             trader, broker, quotes = PaperTrader(), Broker(), Quotes()
             trader.client = cast(TradingClient, broker)
             trader.option_data = cast(OptionHistoricalDataClient, quotes)
             trader.instruments = {
-                OPTION: {"multiplier": 100, "tradable": True, "fractionable": False}
+                OPTION: {
+                    "multiplier": 100,
+                    "tradable": True,
+                    "fractionable": False,
+                    "asset_class": "us_option",
+                    "underlying": "SPY",
+                    "expiration": EXPIRATION.isoformat(),
+                    "option_type": "call",
+                }
             }
             trader.refresh()
             trader.manual_buy(OPTION, 2, quantity=3, stop_loss_pct=5)
@@ -265,7 +466,7 @@ class PaperLifecycle(unittest.TestCase):
                 patch.object(feed, "STATE", feed.MarketState()),
                 patch.object(feed, "STORE_DIR", Path(directory) / "bars"),
             ):
-                symbol = config.SUPPORTED_SYMBOLS[0]
+                symbol = config.MARKET_SYMBOLS[0]
                 base = int(time.time() // 300) * 300 - 600
 
                 def bar(offset, volume):

@@ -24,6 +24,9 @@ type Trade = {
   tp?: number | null;
   sl?: number | null;
   is_manual?: boolean;
+  underlying?: string;
+  expiration?: string;
+  exit_reason?: string;
 };
 type Position = {
   symbol: string;
@@ -40,7 +43,10 @@ type Position = {
   take_profit_price?: number | null;
   stop_loss_pct?: number | null;
   take_profit_pct?: number | null;
-  tp_sl_source?: "jev" | "manual";
+  tp_sl_source?: "jev" | "jev-options" | "manual";
+  underlying?: string;
+  expiration?: string;
+  exit_reason?: string;
 };
 type AgentEvent = {
   timestamp: number;
@@ -53,6 +59,55 @@ type AgentEvent = {
   response?: unknown;
   error?: string | null;
   trade?: Trade;
+};
+type OptionCandidate = {
+  symbol: string;
+  underlying: string;
+  option_type: "call" | "put";
+  expiration: string;
+  strike: number;
+  bid: number;
+  ask: number;
+  spread_pct: number;
+  open_interest: number;
+  max_quantity: number;
+  cost_per_contract: number;
+  limit_price: number;
+};
+type OptionScan = {
+  status: string;
+  reason?: string;
+  error?: string;
+  as_of?: number;
+  discovered?: number;
+  eligible?: number;
+  candidates?: OptionCandidate[];
+};
+type OptionPolicy = {
+  min_dte: number;
+  max_dte: number;
+  min_open_interest: number;
+  max_open_interest_age_days: number;
+  min_quote_size: number;
+  max_spread_pct: number;
+  max_spread_absolute: number;
+  max_quote_age_seconds: number;
+  max_candidates: number;
+  max_trade_pct: number;
+  max_underlying_pct: number;
+  max_total_pct: number;
+  max_contracts: number;
+  stop_loss_pct: number;
+  take_profit_pct: number;
+  exit_dte: number;
+  entry_timeout_seconds: number;
+  exit_reprice_seconds: number;
+  max_price_drift_pct: number;
+};
+type OptionsConfig = {
+  underlyings: string[];
+  policy: OptionPolicy;
+  feed: string;
 };
 type Trading = {
   account: {
@@ -68,16 +123,20 @@ type Trading = {
   agent_log: AgentEvent[];
   positions: Trade[];
   agent_enabled: boolean;
+  stock_symbol: string | null;
   orders: Trade[];
   broker_status: string;
   broker_error: string | null;
+  option_scans?: Record<string, OptionScan>;
+  monitor_error?: string | null;
 };
 type Snapshot = {
   symbol: string;
   supported_symbols: string[];
+  stock_symbols: string[];
   status: string;
   error: string | null;
-  instruments: Record<string, { asset_class: string; multiplier: number }>;
+  instruments: Record<string, { asset_class: string; multiplier: number; underlying?: string; expiration?: string; option_type?: "call" | "put" }>;
   data_feeds: { stocks: string; options: string };
   trading_enabled: boolean;
   price: number | null;
@@ -87,6 +146,7 @@ type Snapshot = {
   last_tick: number | null;
   trading: Trading;
   settings: { capital: number; max_wallet_position_pct: number; risk_appetite: string; trading_enabled: boolean };
+  options?: OptionsConfig;
 };
 
 const feedBase = process.env.NEXT_PUBLIC_MARKET_FEED_URL ?? "http://127.0.0.1:8765";
@@ -135,6 +195,7 @@ const allIndicatorKeys = indicatorGroups.flatMap((group) => group.items.map(([ke
 export default function Home() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [symbol, setSymbol] = useState("");
+  const strategySymbol = snapshot?.trading.stock_symbol ?? "";
   const [capital, setCapital] = useState("100000");
   const [maxWalletPositionPct, setMaxWalletPositionPct] = useState("75");
   const [riskAppetite, setRiskAppetite] = useState("balanced");
@@ -170,14 +231,20 @@ export default function Home() {
       const next = JSON.parse(event.data) as Snapshot;
       setSnapshot(next);
       if (!symbol) setSymbol(next.symbol);
+
       setTradingEnabled(next.trading_enabled);
     };
     source.onerror = () => setSnapshot((current) => (current ? { ...current, status: "feed unavailable", trading: { ...current.trading, broker_status: "unavailable", broker_error: "Feed connection unavailable" } } : null));
     return () => source.close();
   }, [symbol, chartTimeframe]);
 
-  const configurePortfolio = async (enabled = tradingEnabled, selectedSymbol = symbol) => {
-    if (enabled && !window.confirm(`Enable autonomous Alpaca PAPER trading for ${selectedSymbol}? Budget $${capital}, max position ${maxWalletPositionPct}%, risk ${riskAppetite}, timeframes ${activeTimeframes.join(", ")}. Jev may submit buys and sells until stopped.`)) return;
+  // Chart navigation never changes the server-confirmed stock strategy.
+  const configurePortfolio = async (enabled: boolean, selectedSymbol: string) => {
+    if (enabled && !window.confirm(`Enable autonomous Alpaca PAPER trading?
+
+- Stock strategy: ${snapshot?.stock_symbols.includes(selectedSymbol) ? selectedSymbol : "none (options only)"}. Budget $${capital}, max position ${maxWalletPositionPct}%, risk ${riskAppetite}, timeframes ${activeTimeframes.join(", ")}.
+- Options scanning covers ALL configured underlyings, independent of the chart, within the server's hard option policy.
+Jev may submit buys/sells until stopped. Underlying indicators, option candidates and portfolio context are sent to TypeSafe. A key entered here is retained by the feed server for future calls; leave it blank to reuse the server key.`)) return;
     try {
       const response = await fetch(`${feedBase}/config`, {
         method: "POST",
@@ -195,29 +262,36 @@ export default function Home() {
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || "Configuration failed");
       setTradingEnabled(enabled);
+      setSnapshot((current) => current ? { ...current, trading_enabled: enabled, trading: { ...current.trading, stock_symbol: current.stock_symbols.includes(selectedSymbol) ? selectedSymbol : null } } : current);
     } catch (error) {
       setFeedback({ type: "error", text: error instanceof Error ? error.message : "Configuration failed" });
     }
   };
 
-  const price = snapshot?.price;
+  const symbolReady = snapshot?.symbol === symbol;
+  const price = symbolReady ? snapshot?.price : undefined;
   const change = useMemo(() => {
-    const first = snapshot?.bars[0]?.open;
+    const first = symbolReady ? snapshot?.bars[0]?.open : undefined;
     return price && first ? ((price - first) / first) * 100 : null;
-  }, [price, snapshot?.bars]);
+  }, [price, symbolReady, snapshot?.bars]);
 
   const selectedPosition = snapshot?.trading.account.positions[symbol];
   const availableCash = snapshot?.trading.account.available_cash ?? 0;
-  const symbols = snapshot?.supported_symbols ?? ["SPY", "AAPL", "MSFT"];
+  const symbols = snapshot?.supported_symbols ?? [];
   const instrument = snapshot?.instruments[symbol];
   const isOption = instrument?.asset_class === "us_option";
   const multiplier = instrument?.multiplier ?? 1;
   const brokerReady = snapshot?.trading.broker_status === "connected";
   const units = isOption ? "contracts" : "shares";
+  const optionsConfig = snapshot?.options;
   const estimateQuantity = (amount: number) => isOption ? Math.floor(amount / ((price || 1) * multiplier)).toString() : (amount / (price || 1)).toFixed(6);
   const toggle = (name: string) => setOverlays((current) => (current.includes(name) ? current.filter((item) => item !== name) : [...current, name]));
   const toggleIndicator = (name: string) => setSelectedIndicators((current) => (current.includes(name) ? current.filter((item) => item !== name) : [...current, name]));
   const labelFor = (name: string) => indicatorGroups.flatMap((group) => group.items).find(([key]) => key === name)?.[1] ?? name;
+  const heldOptionPositions = Object.entries(snapshot?.trading.account.positions ?? {}).filter(([, position]) => position.asset_class === "us_option" && position.quantity > 0);
+  const proposedStrategySymbol = snapshot?.stock_symbols.includes(symbol) ? symbol : strategySymbol || optionsConfig?.underlyings[0] || "";
+  const proposedScope = snapshot?.stock_symbols.includes(proposedStrategySymbol) ? `stock ${proposedStrategySymbol} + options` : "options only";
+  const runningScope = strategySymbol ? `stock ${strategySymbol} + options` : "options only";
 
   // Execute manual order (buy, sell, exit)
   const handleExecuteOrder = async (action: "buy" | "sell" | "exit", extraParams: Record<string, any> = {}) => {
@@ -353,11 +427,7 @@ export default function Home() {
 
             <select
               value={symbol}
-              onChange={(event) => {
-                const nextSymbol = event.target.value;
-                setSymbol(nextSymbol);
-                void configurePortfolio(false, nextSymbol);
-              }}
+              onChange={(event) => setSymbol(event.target.value)}
             >
               {symbols.map((item) => (
                 <option key={item}>{item}</option>
@@ -395,14 +465,15 @@ export default function Home() {
             <option value="4h">4h</option>
           </select>
         </label>
-        <button className="control" onClick={() => void configurePortfolio()}>Apply settings</button>
-        <button disabled={!brokerReady && !tradingEnabled} className={tradingEnabled ? "trade-toggle running" : "trade-toggle"} onClick={() => void configurePortfolio(!tradingEnabled)}>
-          {tradingEnabled ? `Stop Jev auto-trading ${symbol}` : `Start Jev auto-trading ${symbol}`}
+        <button disabled={!proposedStrategySymbol} className="control" onClick={() => void configurePortfolio(tradingEnabled, proposedStrategySymbol)} title={`Apply budget, risk and timeframes for ${proposedScope}; preserve automation state.`}>Apply settings</button>
+        <button disabled={!brokerReady && !tradingEnabled} className={tradingEnabled ? "trade-toggle running" : "trade-toggle"} onClick={() => void configurePortfolio(!tradingEnabled, tradingEnabled ? strategySymbol || proposedStrategySymbol : proposedStrategySymbol)} title={tradingEnabled ? `Pause ${runningScope}; exit monitoring continues.` : `Start ${proposedScope}; options scanning covers every configured underlying.`}>
+          {tradingEnabled ? `Stop Jev (${runningScope})` : `Start Jev (${proposedScope})`}
         </button>
       </section>
-      <p className="attribution">Broker: {snapshot?.trading.broker_status ?? "connecting"}. Stocks: {snapshot?.data_feeds.stocks ?? "--"}; options: {snapshot?.data_feeds.options ?? "--"}. Budget does not change broker cash. Positions are netted by symbol across timeframes.</p>
-      {snapshot?.data_feeds.options === "indicative" && <p className="attribution">Indicative options data is not executable OPRA/NBBO data. Historical option bars use Alpaca’s historical options endpoint.</p>}
+      <p className="attribution">TypeSafe key: if the field above is filled in, it is sent to and retained by the feed server ({feedBase}) for future automated calls, not just the current request; leave it blank to reuse whatever key the server already has configured.</p>
+      <p className="attribution">Broker: {snapshot?.trading.broker_status ?? "connecting"}. Stocks: {snapshot?.data_feeds.stocks ?? "--"}; options: {snapshot?.data_feeds.options ?? "--"}. Budget does not change broker cash. Positions are netted by symbol across timeframes. Configured stock strategy: {strategySymbol || "none (options only)"}. Options scanning covers every configured underlying, independently of the chart.</p>
       {(snapshot?.trading.broker_error || snapshot?.error) && <p role="alert" className="feedback-banner error">{snapshot.trading.broker_error || snapshot.error}</p>}
+      {snapshot?.trading.monitor_error && <p role="alert" className="feedback-banner error">Exit monitor error: {snapshot.trading.monitor_error}</p>}
       <section className="quote-grid">
         <div className="quote">
           <span className="label">QUOTE MIDPOINT</span>
@@ -412,6 +483,122 @@ export default function Home() {
         <Metric label="RSI (14)" value={snapshot?.indicators.rsi14?.toFixed(2) ?? "--"} />
         <Metric label="MACD" value={snapshot?.indicators.macd?.toFixed(2) ?? "--"} />
         <Metric label="LAST TICK" value={snapshot?.last_tick ? new Date(snapshot.last_tick * 1000).toLocaleTimeString() : "--"} />
+      </section>
+
+      <section className="indicator-panel options-panel">
+        <div className="panel-head">
+          <div>
+            <p className="eyebrow">OPTIONS RADAR</p>
+            <h2>Autonomous scan across configured underlyings</h2>
+          </div>
+          <span className="muted">
+            {optionsConfig ? `${optionsConfig.feed} feed · paper trading` : "Waiting for options configuration…"}
+          </span>
+        </div>
+
+        {!optionsConfig ? (
+          <p className="muted">Options configuration has not loaded from the feed yet.</p>
+        ) : optionsConfig.underlyings.length === 0 ? (
+          <p className="muted">No ALPACA_OPTION_UNDERLYINGS configured on the server; options scanning is disabled.</p>
+        ) : (
+          <>
+            {optionsConfig.feed === "indicative" && (
+              <p className="attribution">
+                Indicative paper pricing is enabled: quotes are derived, not executable OPRA/NBBO, and trades are delayed 15 minutes. Spread and depth checks use this indicative feed; simulated results do not establish live execution quality.
+              </p>
+            )}
+
+            <details className="position-record">
+              <summary className="position-head">
+                <strong>Active policy limits</strong>
+                <span className="muted">
+                  DTE {optionsConfig.policy.min_dte}{"\u2013"}{optionsConfig.policy.max_dte}d {"\u00b7"} exit {optionsConfig.policy.exit_dte}d {"\u00b7"} TP +{optionsConfig.policy.take_profit_pct}% / SL -{optionsConfig.policy.stop_loss_pct}% {"\u00b7"} 19 parameters
+                </span>
+              </summary>
+              <div className="account-grid">
+                <Metric label="MIN DTE" value={`${optionsConfig.policy.min_dte}d`} />
+                <Metric label="MAX DTE" value={`${optionsConfig.policy.max_dte}d`} />
+                <Metric label="EXIT DTE" value={`${optionsConfig.policy.exit_dte}d`} />
+                <Metric label="MIN OPEN INTEREST" value={`${optionsConfig.policy.min_open_interest}`} />
+                <Metric label="MAX OI AGE" value={`${optionsConfig.policy.max_open_interest_age_days}d`} />
+                <Metric label="MIN QUOTE SIZE" value={`${optionsConfig.policy.min_quote_size}`} />
+                <Metric label="MAX SPREAD %" value={`${(optionsConfig.policy.max_spread_pct * 100).toFixed(1)}%`} />
+                <Metric label="MAX SPREAD $" value={`$${optionsConfig.policy.max_spread_absolute.toFixed(2)}`} />
+                <Metric label="MAX QUOTE AGE" value={`${optionsConfig.policy.max_quote_age_seconds}s`} />
+                <Metric label="MAX CANDIDATES" value={`${optionsConfig.policy.max_candidates}`} />
+                <Metric label="MAX PER-TRADE" value={`${(optionsConfig.policy.max_trade_pct * 100).toFixed(2)}%`} />
+                <Metric label="MAX PER-UNDERLYING" value={`${(optionsConfig.policy.max_underlying_pct * 100).toFixed(2)}%`} />
+                <Metric label="MAX TOTAL" value={`${(optionsConfig.policy.max_total_pct * 100).toFixed(2)}%`} />
+                <Metric label="MAX CONTRACTS" value={`${optionsConfig.policy.max_contracts}`} />
+                <Metric label="TAKE PROFIT" value={`+${optionsConfig.policy.take_profit_pct}%`} />
+                <Metric label="STOP LOSS" value={`-${optionsConfig.policy.stop_loss_pct}%`} />
+                <Metric label="ENTRY TIMEOUT" value={`${optionsConfig.policy.entry_timeout_seconds}s`} />
+                <Metric label="EXIT REPRICE" value={`${optionsConfig.policy.exit_reprice_seconds}s`} />
+                <Metric label="MAX PRICE DRIFT" value={`${(optionsConfig.policy.max_price_drift_pct * 100).toFixed(1)}%`} />
+              </div>
+            </details>
+
+            <div className="positions-list">
+              {optionsConfig.underlyings.map((underlying) => {
+                const scan = snapshot?.trading.option_scans?.[underlying];
+                const scanRan = !!scan && (scan.as_of != null || scan.discovered != null || scan.eligible != null || scan.reason != null || scan.error != null);
+                return (
+                  <details className="position-record" key={underlying}>
+                    <summary className="position-head">
+                      <div className="trade-tag-group">
+                        <strong>{underlying}</strong>
+                        <span className="trade-reason-tag">{scan?.status ?? "pending"}</span>
+                      </div>
+                      <span className="muted">{scanRan ? `${scan?.discovered ?? "--"} found \u00b7 ${scan?.eligible ?? "--"} eligible` : "awaiting first scan"}</span>
+                      <time>{scan?.as_of ? new Date(scan.as_of * 1000).toLocaleTimeString() : "--"}</time>
+                    </summary>
+                    {scan?.error ? <p role="alert" className="feedback-banner error">{scan.error}</p> : null}
+                    {scan?.reason ? <p className="muted">{scan.reason}</p> : null}
+                    {scan?.candidates?.length ? (
+                      <div className="indicator-options">
+                        {scan.candidates.map((candidate) => (
+                          <button
+                            type="button"
+                            key={candidate.symbol}
+                            className={symbol === candidate.symbol ? "indicator-option active" : "indicator-option"}
+                            onClick={() => setSymbol(candidate.symbol)}
+                            title={`View ${candidate.symbol} on the chart`}
+                          >
+                            <span className={candidate.option_type === "call" ? "text-lime" : "text-coral"}>{candidate.option_type.toUpperCase()}</span>
+                            {" "}{candidate.expiration} &middot; ${candidate.strike.toFixed(2)} &middot; spread {(candidate.spread_pct * 100).toFixed(1)}% &middot; OI {candidate.open_interest} &middot; premium ${candidate.limit_price.toFixed(2)} (${candidate.cost_per_contract.toFixed(2)}/contract)
+                          </button>
+                        ))}
+                      </div>
+                    ) : scanRan ? (
+                      <p className="muted">No eligible candidates from the last scan.</p>
+                    ) : (
+                      <p className="muted">Awaiting first scan.</p>
+                    )}
+                  </details>
+                );
+              })}
+            </div>
+          </>
+        )}
+
+        {heldOptionPositions.length ? (
+          <>
+            <span className="label">HELD OPTION POSITIONS</span>
+            <div className="indicator-options">
+              {heldOptionPositions.map(([heldSymbol, position]) => (
+                <button
+                  type="button"
+                  key={heldSymbol}
+                  className={symbol === heldSymbol ? "indicator-option active" : "indicator-option"}
+                  onClick={() => setSymbol(heldSymbol)}
+                  title={`View held position ${heldSymbol} on the chart`}
+                >
+                  {position.underlying ?? heldSymbol}{position.expiration ? ` \u00b7 ${position.expiration}` : ""} &middot; {position.quantity} ct &middot; {position.unrealized_pnl_pct >= 0 ? "+" : ""}{position.unrealized_pnl_pct.toFixed(1)}%
+                </button>
+              ))}
+            </div>
+          </>
+        ) : null}
       </section>
 
       <div className="workspace-grid">
@@ -440,7 +627,7 @@ export default function Home() {
                 ))}
               </div>
             </div>
-            {snapshot ? (
+            {snapshot && symbolReady ? (
               <MarketChart bars={snapshot.bars} indicatorSeries={snapshot.indicator_series} overlays={overlays} position={selectedPosition} />
             ) : (
               <div className="loading">Waiting for the market feed...</div>
@@ -487,7 +674,7 @@ export default function Home() {
             <Metric label="SMA 50" value={snapshot?.indicators.sma50?.toFixed(2) ?? "Warming up"} />
             <div className="note">
               <span className="label">PIPELINE</span>
-              <p>Local TP/SL monitoring remains active while Jev is paused. Exits require this feed process, a fresh quote, and an open market; fills are not guaranteed.</p>
+              <p>Local TP/SL and options (stop loss, take profit, expiry) exit monitoring remains active for open positions while Jev is paused. Exits require this feed process, a fresh quote, and an open market; fills are not guaranteed.</p>
             </div>
           </section>
         </div>
@@ -534,7 +721,7 @@ export default function Home() {
               <div className="pos-card-header">
                 <div className="pos-badge">
                   <span className="pos-side">LONG {selectedPosition.symbol}</span>
-                  <span className="pos-source">{selectedPosition.tp_sl_source === "jev" ? "🤖 JEV AUTO" : "👤 MANUAL"}</span>
+                  <span className="pos-source">{selectedPosition.tp_sl_source === "jev" || selectedPosition.tp_sl_source === "jev-options" ? "JEV AUTO" : "MANUAL"}</span>
                 </div>
                 <div className={`pos-pnl ${selectedPosition.unrealized_pnl_pct >= 0 ? "positive" : "negative"}`}>
                   {selectedPosition.unrealized_pnl_pct >= 0 ? "+" : ""}
@@ -567,6 +754,18 @@ export default function Home() {
                       : "None"}
                   </strong>
                 </div>
+                {selectedPosition.expiration ? (
+                  <div className="pos-metric">
+                    <span className="pos-label">Expiry:</span>
+                    <strong>{selectedPosition.expiration}</strong>
+                  </div>
+                ) : null}
+                {selectedPosition.exit_reason ? (
+                  <div className="pos-metric">
+                    <span className="pos-label">Exit reason:</span>
+                    <strong>{selectedPosition.exit_reason}</strong>
+                  </div>
+                ) : null}
               </div>
               <p className="size-hint">Market value: {money(selectedPosition.market_value)} · Unrealized P&amp;L: {money(selectedPosition.unrealized_pnl)}</p>
 
@@ -609,7 +808,7 @@ export default function Home() {
                     className="exit-btn danger"
                     onClick={() => handleExecuteOrder("exit")}
                     disabled={orderLoading || !brokerReady}
-                    title="Submit an order to exit this position; execution is not guaranteed"
+                    title="Submit a paper order to exit this position; execution is not guaranteed"
                   >
                     {orderLoading ? "Exiting..." : `Exit Position (100%)`}
                   </button>
@@ -954,7 +1153,7 @@ export default function Home() {
                               ? "🎯 TAKE PROFIT"
                               : trade.is_manual
                               ? "👤 MANUAL"
-                              : trade.reason === "jev" ? "JEV AUTO" : "ALPACA"}
+                              : trade.reason === "jev" || trade.reason === "jev-options" ? "JEV AUTO" : "ALPACA"}
                           </span>
                         </div>
                         <time>{new Date(trade.timestamp * 1000).toLocaleString()}</time>
@@ -964,6 +1163,8 @@ export default function Home() {
                         <Metric label="QUANTITY" value={trade.quantity.toFixed(6)} />
                         <Metric label="STATUS" value={trade.status ?? "filled"} />
                         <Metric label="REALIZED P&L" value={money(trade.realized_pnl)} />
+                        {trade.expiration ? <Metric label="EXPIRY" value={trade.expiration} /> : null}
+                        {trade.exit_reason ? <Metric label="EXIT REASON" value={trade.exit_reason} /> : null}
                         {trade.tp ? (
                           <Metric label="TAKE PROFIT" value={`$${trade.tp.toLocaleString(undefined, { maximumFractionDigits: 2 })}`} />
                         ) : null}

@@ -36,7 +36,7 @@ else:
     from api_models import CONFIG_PAYLOAD, ORDER_PAYLOAD
     from paper_trader import PaperTrader
 
-SUPPORTED_SYMBOLS = config.SUPPORTED_SYMBOLS
+MARKET_SYMBOLS = config.MARKET_SYMBOLS
 TIMEFRAMES = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8765"))
@@ -47,11 +47,11 @@ STORE_DIR = Path(__file__).with_name("alpaca_market_data")
 class MarketState:
     def __init__(self) -> None:
         self.lock = threading.RLock()
-        self.selected_symbol = SUPPORTED_SYMBOLS[0]
+        self.selected_symbol = MARKET_SYMBOLS[0]
         self.trading_enabled = False
         self.markets = {
             s: {"bars": [], "price": None, "last_tick": None, "status": "starting", "error": None}
-            for s in SUPPORTED_SYMBOLS
+            for s in MARKET_SYMBOLS
         }
         self.capital = 100_000.0
         self.max_wallet_position_pct = 0.75
@@ -60,29 +60,34 @@ class MarketState:
         self.chart_timeframe = "1m"
 
     def snapshot(self, symbol: str | None = None, timeframe: str | None = None) -> dict[str, Any]:
-        with self.lock:
+        with self.lock, TRADER.lock:
             selected = symbol or self.selected_symbol
             tf = timeframe or self.chart_timeframe
-            if selected not in SUPPORTED_SYMBOLS or tf not in TIMEFRAMES:
+            supported = TRADER.symbols()
+            if selected not in supported and selected in TRADER.instruments:
+                supported = (*supported, selected)
+            if selected not in supported or tf not in TIMEFRAMES:
                 raise ValueError("Unknown symbol or timeframe")
-            market = self.markets[selected]
+            TRADER.chart_requests[selected] = time.time()
+            market = self.markets.setdefault(
+                selected,
+                {"bars": [], "price": None, "last_tick": None, "status": "starting", "error": None},
+            )
             bars = resample_bars(market["bars"], tf)
             completed = [bar for bar in bars if bar["time"] + TIMEFRAMES[tf] <= time.time()]
             price = market["price"] or (bars[-1]["close"] if bars else None)
             return {
                 "symbol": selected,
-                "supported_symbols": SUPPORTED_SYMBOLS,
+                "supported_symbols": supported,
+                "stock_symbols": config.STOCK_SYMBOLS,
                 "instruments": {
-                    s: TRADER.instruments.get(
-                        s,
-                        {
-                            "asset_class": "us_option"
-                            if s in config.OPTION_SYMBOLS
-                            else "us_equity",
-                            "multiplier": 100 if s in config.OPTION_SYMBOLS else 1,
-                        },
-                    )
-                    for s in SUPPORTED_SYMBOLS
+                    s: TRADER.instruments.get(s, {"asset_class": "us_equity", "multiplier": 1})
+                    for s in supported
+                },
+                "options": {
+                    "underlyings": config.OPTION_UNDERLYINGS,
+                    "policy": config.OPTIONS.model_dump(),
+                    "feed": config.OPTION_FEED.value,
                 },
                 "data_feeds": {
                     "stocks": config.STOCK_FEED.value,
@@ -309,10 +314,14 @@ def merge_bars(symbol: str, incoming: list[Any]) -> None:
         # Never replay historical decisions on warm start or after a long outage.
         if previous is None or latest is None or latest <= previous or time.time() - latest > 180:
             return
-        if STATE.trading_enabled and symbol == STATE.selected_symbol:
+        if STATE.trading_enabled:
             for tf in STATE.active_timeframes:
                 if (latest + 60) // TIMEFRAMES[tf] > (previous + 60) // TIMEFRAMES[tf]:
-                    TRADER.submit(build_agent_state(symbol, tf))
+                    state = build_agent_state(symbol, tf)
+                    if symbol in config.OPTION_UNDERLYINGS:
+                        TRADER.submit(state, strategy="options")
+                    if symbol == STATE.selected_symbol and symbol in config.STOCK_SYMBOLS:
+                        TRADER.submit(state, strategy="stock")
 
 
 def build_agent_state(symbol: str, timeframe: str = "1m") -> dict[str, Any]:
@@ -345,11 +354,13 @@ def build_agent_state(symbol: str, timeframe: str = "1m") -> dict[str, Any]:
         position = trading["positions"].get(symbol, {})
         return {
             "symbol": symbol,
-            "asset_class": "us_option" if symbol in config.OPTION_SYMBOLS else "us_equity",
+            "asset_class": "us_option" if TRADER.is_option(symbol) else "us_equity",
             "contract_multiplier": TRADER.instruments.get(symbol, {}).get(
-                "multiplier", 100 if symbol in config.OPTION_SYMBOLS else 1
+                "multiplier", 100 if TRADER.is_option(symbol) else 1
             ),
             "current_price": price,
+            "bar_time": completed[-1]["time"] if completed else None,
+            "quote_time": market["last_tick"],
             "oscillators": {
                 key: value
                 for key, value in indicators.items()
@@ -424,7 +435,7 @@ def build_agent_state(symbol: str, timeframe: str = "1m") -> dict[str, Any]:
 def market_worker() -> None:
     clients = None
     last_history: dict[str, float] = {}
-    for symbol in SUPPORTED_SYMBOLS:
+    for symbol in MARKET_SYMBOLS:
         path = STORE_DIR / f"{symbol}.json"
         if path.exists():
             try:
@@ -436,7 +447,14 @@ def market_worker() -> None:
             except (ValueError, OSError) as error:
                 STATE.markets[symbol]["error"] = str(error)
     while True:
-        for symbol in SUPPORTED_SYMBOLS:
+        with TRADER.lock:
+            TRADER.chart_requests = {
+                s: requested
+                for s, requested in TRADER.chart_requests.items()
+                if time.time() - requested <= 30
+            }
+            watched = tuple(dict.fromkeys([*MARKET_SYMBOLS, *TRADER.chart_requests]))
+        for symbol in watched:
             try:
                 if clients is None:
                     key, secret = config.credentials()
@@ -445,7 +463,7 @@ def market_worker() -> None:
                         OptionHistoricalDataClient(key, secret),
                     )
                 stock, option = clients
-                is_option = symbol in config.OPTION_SYMBOLS
+                is_option = TRADER.is_option(symbol)
                 if is_option:
                     quotes = option.get_option_latest_quote(
                         OptionLatestQuoteRequest(symbol_or_symbols=symbol, feed=config.OPTION_FEED)
@@ -467,7 +485,7 @@ def market_worker() -> None:
                                 status="live" if -5 <= age <= 30 else "stale / market closed",
                                 error=None,
                             )
-                        if -5 <= age <= 30:
+                        if -5 <= age <= 30 and not is_option:
                             try:
                                 TRADER.check_tp_sl(symbol, quote.bid_price)
                             except Exception as error:
@@ -516,7 +534,7 @@ def configure(payload: dict[str, Any]) -> None:
         pct = request.get("max_wallet_position_pct", STATE.max_wallet_position_pct)
         risk = request.get("risk_appetite", STATE.risk_appetite)
         key = request.get("typesafe_api_key")
-        if symbol not in SUPPORTED_SYMBOLS:
+        if symbol not in TRADER.symbols():
             raise ValueError("Symbol is not configured")
         if any(tf not in TIMEFRAMES for tf in frames):
             raise ValueError("Choose supported analysis timeframes")
@@ -645,7 +663,7 @@ class FeedHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "trade": TRADER.cancel_order(payload["order_id"])})
                 return
             symbol = payload.get("symbol", STATE.selected_symbol)
-            if symbol not in SUPPORTED_SYMBOLS:
+            if symbol not in TRADER.symbols():
                 raise ValueError("Symbol is not configured")
             price = STATE.snapshot(symbol)["price"]
             fields = {

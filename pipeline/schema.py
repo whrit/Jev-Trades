@@ -146,3 +146,26 @@ Questions = {
         ],
     },
 }
+
+
+def option_questions(state: dict) -> dict:
+    criteria = {
+        "hold": "Do not enter or exit an option; use this when conditions or the shortlist provide no clear edge."
+    }
+    for candidate in state["candidates"]:
+        criteria[f"buy:{candidate['symbol']}"] = (
+            f"Buy this verified long {candidate['option_type']} on {candidate['underlying']}, "
+            f"strike {candidate['strike']}, expiration {candidate['expiration']}. "
+            "Evaluate premium, spread, liquidity, expiry and available Greeks against the underlying signals."
+        )
+    for position in state["option_positions"]:
+        criteria[f"sell:{position['symbol']}"] = (
+            "Close this held long option when its thesis has failed or its remaining risk outweighs its opportunity."
+        )
+    return {
+        "option_action": {
+            "type": "choice",
+            "instructions": "Analyze the underlying stock's price, indicators, volume and volatility. Choose one listed contract or hold. Calls require a bullish thesis; puts require a bearish thesis. Never invent a contract or quantity. Long options can lose their entire premium. Hard risk limits and exits remain outside your control. When option_feed is indicative, quotes are derived rather than executable NBBO; do not infer live execution quality from indicative spreads, depth or paper results.",
+            "criteria": criteria,
+        }
+    }

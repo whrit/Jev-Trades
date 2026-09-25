@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import Image from "next/image";
+
 import { useEffect, useMemo, useState } from "react";
 
 const MarketChart = dynamic(() => import("./market-chart"), { ssr: false });
@@ -12,10 +12,13 @@ type Trade = {
   symbol: string;
   side: "buy" | "sell";
   quantity: number;
-  price: number;
-  entry_price: number;
+  price: number | null;
+  entry_price: number | null;
   realized_pnl: number | null;
-  cash_balance: number;
+  cash_balance: number | null;
+  id?: string;
+  status?: string;
+  filled_qty?: number;
   timestamp: number;
   reason?: string;
   tp?: number | null;
@@ -29,6 +32,10 @@ type Position = {
   mark_price: number;
   unrealized_pnl_pct: number;
   position: string;
+  multiplier: number;
+  asset_class: string;
+  market_value: number;
+  unrealized_pnl: number;
   stop_loss_price?: number | null;
   take_profit_price?: number | null;
   stop_loss_pct?: number | null;
@@ -50,9 +57,9 @@ type AgentEvent = {
 type Trading = {
   account: {
     starting_cash: number;
-    cash_balance: number;
-    available_cash: number;
-    equity: number;
+    cash_balance: number | null;
+    available_cash: number | null;
+    equity: number | null;
     positions: Record<string, Position>;
     max_wallet_position_pct: number;
     risk_appetite: string;
@@ -61,11 +68,17 @@ type Trading = {
   agent_log: AgentEvent[];
   positions: Trade[];
   agent_enabled: boolean;
+  orders: Trade[];
+  broker_status: string;
+  broker_error: string | null;
 };
 type Snapshot = {
   symbol: string;
   supported_symbols: string[];
   status: string;
+  error: string | null;
+  instruments: Record<string, { asset_class: string; multiplier: number }>;
+  data_feeds: { stocks: string; options: string };
   trading_enabled: boolean;
   price: number | null;
   bars: Bar[];
@@ -78,16 +91,7 @@ type Snapshot = {
 
 const feedBase = process.env.NEXT_PUBLIC_MARKET_FEED_URL ?? "http://127.0.0.1:8765";
 const streamBase = process.env.NEXT_PUBLIC_MARKET_STREAM_URL ?? `${feedBase}/stream`;
-const symbols = ["ADA-USD", "XRP-USD", "ETH-USD", "BTC-USD", "SOL-USD", "BNB-USD", "TRX-USD"];
-const assetLogos: Record<string, string> = {
-  "ADA-USD": "/logos/ada.png",
-  "XRP-USD": "/logos/xrp.svg",
-  "ETH-USD": "/logos/eth.svg",
-  "BTC-USD": "/logos/btc.svg",
-  "SOL-USD": "/logos/sol.svg",
-  "BNB-USD": "/logos/bnb.png",
-  "TRX-USD": "/logos/trx.png",
-};
+const money = (value: number | null | undefined) => value == null ? "--" : `$${value.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
 const indicatorGroups: { title: string; items: [string, string][] }[] = [
   {
     title: "Moving averages",
@@ -130,7 +134,7 @@ const allIndicatorKeys = indicatorGroups.flatMap((group) => group.items.map(([ke
 
 export default function Home() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
-  const [symbol, setSymbol] = useState("BTC-USD");
+  const [symbol, setSymbol] = useState("");
   const [capital, setCapital] = useState("100000");
   const [maxWalletPositionPct, setMaxWalletPositionPct] = useState("75");
   const [riskAppetite, setRiskAppetite] = useState("balanced");
@@ -140,14 +144,14 @@ export default function Home() {
   const [selectedIndicators, setSelectedIndicators] = useState(["ema_20", "sma_50", "relative_strength_index_14", "macd_level_12_26"]);
   const [activityTab, setActivityTab] = useState<"manual" | "logs" | "positions">("manual");
   const [activeTimeframes, setActiveTimeframes] = useState<string[]>(["1m"]);
-  const [tradeTimeframe, setTradeTimeframe] = useState<string>("1m");
+  const [limitPrice, setLimitPrice] = useState("");
   const [chartTimeframe, setChartTimeframe] = useState<string>("1m");
 
   // Manual Trading State
   const [orderSide, setOrderSide] = useState<"buy" | "sell">("buy");
-  const [sizingMode, setSizingMode] = useState<"usd" | "crypto">("usd");
+  const [sizingMode, setSizingMode] = useState<"usd" | "quantity">("usd");
   const [orderAmountUsd, setOrderAmountUsd] = useState("5000");
-  const [orderQuantityCrypto, setOrderQuantityCrypto] = useState("0.05");
+  const [orderQuantity, setOrderQuantity] = useState("1");
   const [tpEnabled, setTpEnabled] = useState(true);
   const [tpPct, setTpPct] = useState("5.0");
   const [slEnabled, setSlEnabled] = useState(true);
@@ -165,18 +169,20 @@ export default function Home() {
     source.onmessage = (event) => {
       const next = JSON.parse(event.data) as Snapshot;
       setSnapshot(next);
+      if (!symbol) setSymbol(next.symbol);
       setTradingEnabled(next.trading_enabled);
     };
-    source.onerror = () => setSnapshot((current) => (current ? { ...current, status: "feed unavailable" } : null));
+    source.onerror = () => setSnapshot((current) => (current ? { ...current, status: "feed unavailable", trading: { ...current.trading, broker_status: "unavailable", broker_error: "Feed connection unavailable" } } : null));
     return () => source.close();
   }, [symbol, chartTimeframe]);
 
   const configurePortfolio = async (enabled = tradingEnabled, selectedSymbol = symbol) => {
+    if (enabled && !window.confirm(`Enable autonomous Alpaca PAPER trading for ${selectedSymbol}? Budget $${capital}, max position ${maxWalletPositionPct}%, risk ${riskAppetite}, timeframes ${activeTimeframes.join(", ")}. Jev may submit buys and sells until stopped.`)) return;
     try {
       const response = await fetch(`${feedBase}/config`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+        body: JSON.stringify(tradingEnabled && !enabled ? { symbol: selectedSymbol, trading_enabled: false } : {
           symbol: selectedSymbol,
           capital: Number(capital),
           max_wallet_position_pct: Number(maxWalletPositionPct) / 100,
@@ -186,10 +192,11 @@ export default function Home() {
           active_timeframes: activeTimeframes,
         }),
       });
-      if (!response.ok) throw new Error(`Configuration request failed (${response.status})`);
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || "Configuration failed");
       setTradingEnabled(enabled);
     } catch (error) {
-      console.error("Could not configure the paper-trading feed", error);
+      setFeedback({ type: "error", text: error instanceof Error ? error.message : "Configuration failed" });
     }
   };
 
@@ -201,7 +208,13 @@ export default function Home() {
 
   const selectedPosition = snapshot?.trading.account.positions[symbol];
   const availableCash = snapshot?.trading.account.available_cash ?? 0;
-
+  const symbols = snapshot?.supported_symbols ?? ["SPY", "AAPL", "MSFT"];
+  const instrument = snapshot?.instruments[symbol];
+  const isOption = instrument?.asset_class === "us_option";
+  const multiplier = instrument?.multiplier ?? 1;
+  const brokerReady = snapshot?.trading.broker_status === "connected";
+  const units = isOption ? "contracts" : "shares";
+  const estimateQuantity = (amount: number) => isOption ? Math.floor(amount / ((price || 1) * multiplier)).toString() : (amount / (price || 1)).toFixed(6);
   const toggle = (name: string) => setOverlays((current) => (current.includes(name) ? current.filter((item) => item !== name) : [...current, name]));
   const toggleIndicator = (name: string) => setSelectedIndicators((current) => (current.includes(name) ? current.filter((item) => item !== name) : [...current, name]));
   const labelFor = (name: string) => indicatorGroups.flatMap((group) => group.items).find(([key]) => key === name)?.[1] ?? name;
@@ -214,7 +227,7 @@ export default function Home() {
       const payload: Record<string, any> = {
         action,
         symbol,
-        timeframe: tradeTimeframe,
+        limit_price: limitPrice ? Number(limitPrice) : undefined,
         ...extraParams,
       };
 
@@ -222,7 +235,7 @@ export default function Home() {
         if (sizingMode === "usd") {
           payload.amount_usd = Number(orderAmountUsd);
         } else {
-          payload.quantity = Number(orderQuantityCrypto);
+          payload.quantity = Number(orderQuantity);
         }
         if (tpEnabled && Number(tpPct) > 0) {
           payload.take_profit_pct = Number(tpPct);
@@ -232,14 +245,14 @@ export default function Home() {
         }
       } else if (action === "sell") {
         if (!extraParams.pct_of_position) {
-          if (sizingMode === "crypto" && Number(orderQuantityCrypto) > 0) {
-            payload.quantity = Number(orderQuantityCrypto);
+          if (sizingMode === "quantity" && Number(orderQuantity) > 0) {
+            payload.quantity = Number(orderQuantity);
           } else {
             payload.pct_of_position = 1.0;
           }
         }
       }
-
+      if (!window.confirm(`Submit Alpaca PAPER ${action.toUpperCase()} for ${symbol}? ${JSON.stringify(payload)}. Stocks use market orders unless a limit is set; options use DAY limit orders. Fills are not guaranteed.`)) return;
       const res = await fetch(`${feedBase}/order`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -249,7 +262,7 @@ export default function Home() {
       if (!res.ok || !data.ok) {
         throw new Error(data.error || "Order execution failed");
       }
-      setFeedback({ type: "success", text: `${action.toUpperCase()} order executed successfully!` });
+      setFeedback({ type: "success", text: `${action.toUpperCase()} order ${data.trade.status}; filled ${data.trade.filled_qty ?? 0}.` });
       setTimeout(() => setFeedback(null), 4000);
     } catch (err: any) {
       setFeedback({ type: "error", text: err.message || "Execution error" });
@@ -260,6 +273,7 @@ export default function Home() {
   };
 
   const handleUpdatePositionTpSl = async () => {
+    if (!window.confirm(`Update local paper exit targets for ${symbol}: TP ${editTpVal || "unchanged"}%, SL ${editSlVal || "unchanged"}%? Monitoring requires the feed process to remain running.`)) return;
     setOrderLoading(true);
     try {
       const res = await fetch(`${feedBase}/order`, {
@@ -268,7 +282,7 @@ export default function Home() {
         body: JSON.stringify({
           action: "update_tp_sl",
           symbol,
-          timeframe: tradeTimeframe,
+
           take_profit_pct: editTpVal ? Number(editTpVal) : undefined,
           stop_loss_pct: editSlVal ? Number(editSlVal) : undefined,
         }),
@@ -293,7 +307,21 @@ export default function Home() {
     const targetUsd = (availableCash * (pct / 100)).toFixed(2);
     setOrderAmountUsd(targetUsd);
     if (price && price > 0) {
-      setOrderQuantityCrypto((Number(targetUsd) / price).toFixed(6));
+      setOrderQuantity(estimateQuantity(Number(targetUsd)));
+    }
+  };
+  const cancelOrder = async (order: Trade) => {
+    if (!window.confirm(`Cancel Alpaca PAPER order ${order.id} for ${order.symbol} (${order.side}, ${order.quantity})?`)) return;
+    try {
+      const response = await fetch(`${feedBase}/order`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "cancel", order_id: order.id }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || "Cancellation failed");
+      setFeedback({ type: "success", text: "Cancellation requested; awaiting broker confirmation." });
+    } catch (error) {
+      setFeedback({ type: "error", text: error instanceof Error ? error.message : "Cancellation failed" });
     }
   };
 
@@ -301,7 +329,7 @@ export default function Home() {
     <main className="dashboard">
       <header className="topbar">
         <div>
-          <p className="eyebrow">JEV TRADES / LIVE FEED</p>
+          <p className="eyebrow">JEV TRADES / ALPACA PAPER</p>
           <h1>{symbol}</h1>
           <p className="muted">
             {symbol} <span className="dot" /> {chartTimeframe === "1m" ? "1 minute" : chartTimeframe === "5m" ? "5 minute" : chartTimeframe === "15m" ? "15 minute" : chartTimeframe === "1h" ? "1 hour" : "4 hour"} candles
@@ -322,7 +350,7 @@ export default function Home() {
         <label>
           ASSET
           <div className="asset-picker">
-            <Image src={assetLogos[symbol]} alt="" className="asset-logo" width={22} height={22} />
+
             <select
               value={symbol}
               onChange={(event) => {
@@ -338,7 +366,7 @@ export default function Home() {
           </div>
         </label>
         <label>
-          CAPITAL
+          STRATEGY BUDGET ($)
           <input type="number" min="0" step="100" value={capital} onChange={(event) => setCapital(event.target.value)} />
         </label>
         <label>
@@ -367,17 +395,17 @@ export default function Home() {
             <option value="4h">4h</option>
           </select>
         </label>
-        <button className="control" onClick={() => void configurePortfolio()}>
-          Apply portfolio
-        </button>
-        <button className={tradingEnabled ? "trade-toggle running" : "trade-toggle"} onClick={() => void configurePortfolio(!tradingEnabled)}>
+        <button className="control" onClick={() => void configurePortfolio()}>Apply settings</button>
+        <button disabled={!brokerReady && !tradingEnabled} className={tradingEnabled ? "trade-toggle running" : "trade-toggle"} onClick={() => void configurePortfolio(!tradingEnabled)}>
           {tradingEnabled ? `Stop Jev auto-trading ${symbol}` : `Start Jev auto-trading ${symbol}`}
         </button>
       </section>
-
+      <p className="attribution">Broker: {snapshot?.trading.broker_status ?? "connecting"}. Stocks: {snapshot?.data_feeds.stocks ?? "--"}; options: {snapshot?.data_feeds.options ?? "--"}. Budget does not change broker cash. Positions are netted by symbol across timeframes.</p>
+      {snapshot?.data_feeds.options === "indicative" && <p className="attribution">Indicative options data is not executable OPRA/NBBO data. Historical option bars use Alpaca’s historical options endpoint.</p>}
+      {(snapshot?.trading.broker_error || snapshot?.error) && <p role="alert" className="feedback-banner error">{snapshot.trading.broker_error || snapshot.error}</p>}
       <section className="quote-grid">
         <div className="quote">
-          <span className="label">LAST PRICE</span>
+          <span className="label">QUOTE MIDPOINT</span>
           <strong>{price ? `$${price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "--"}</strong>
           <span className={change !== null && change >= 0 ? "positive" : "negative"}>{change === null ? "Waiting for ticks" : `${change >= 0 ? "+" : ""}${change.toFixed(2)}% session`}</span>
         </div>
@@ -417,7 +445,7 @@ export default function Home() {
             ) : (
               <div className="loading">Waiting for the market feed...</div>
             )}
-            <p className="attribution">Charts powered by TradingView Lightweight Charts with dynamic Entry, TP, and SL lines. Data: Yahoo Finance.</p>
+            <p className="attribution">TradingView Lightweight Charts. Alpaca completed one-minute bars polled every minute; quotes polled every five seconds.</p>
           </section>
 
           <section className="indicator-panel">
@@ -459,7 +487,7 @@ export default function Home() {
             <Metric label="SMA 50" value={snapshot?.indicators.sma50?.toFixed(2) ?? "Warming up"} />
             <div className="note">
               <span className="label">PIPELINE</span>
-              <p>Jev autonomous decision engine & manual trade execution with automated Take Profit & Stop Loss triggers.</p>
+              <p>Local TP/SL monitoring remains active while Jev is paused. Exits require this feed process, a fresh quote, and an open market; fills are not guaranteed.</p>
             </div>
           </section>
         </div>
@@ -470,15 +498,28 @@ export default function Home() {
               <p className="eyebrow">PAPER PORTFOLIO & EXECUTION</p>
               <h2>Live Trade Desk</h2>
             </div>
-            <span className="paper-badge">SIMULATION ONLY</span>
+            <span className="paper-badge">ALPACA PAPER</span>
           </div>
+          <details>
+            <summary>Broker orders ({snapshot?.trading.orders.length ?? 0})</summary>
+            {snapshot?.trading.orders.map((order, index) => (
+              <div className="position-record" key={order.id ?? index}>
+                <strong>{order.symbol} {order.side} — {order.status}</strong>
+                <p>{order.filled_qty ?? 0} / {order.quantity} filled · {money(order.price)}</p>
+                {order.id && !["filled", "canceled", "expired", "rejected", "replaced"].includes(order.status ?? "") && (
+                  <button className="control" onClick={() => void cancelOrder(order)}>Cancel order</button>
+                )}
+                {order.status === "unknown" && <p role="alert">Submission outcome unknown. This symbol is blocked until broker reconciliation; do not resubmit.</p>}
+              </div>
+            ))}
+          </details>
 
           <div className="account-grid">
-            <Metric label="AVAILABLE CASH" value={snapshot ? `$${snapshot.trading.account.available_cash.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "--"} />
-            <Metric label="EQUITY" value={snapshot ? `$${snapshot.trading.account.equity.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "--"} />
-            <Metric label={`${symbol} POSITION`} value={selectedPosition ? `${selectedPosition.quantity.toFixed(4)} ${symbol.split("-")[0]}` : "Flat"} />
+            <Metric label="AVAILABLE CASH" value={money(snapshot?.trading.account.available_cash)} />
+            <Metric label="EQUITY" value={money(snapshot?.trading.account.equity)} />
+            <Metric label="POSITION SIZE" value={selectedPosition ? `${selectedPosition.quantity.toFixed(isOption ? 0 : 4)} ${units}` : "Flat"} />
             <Metric
-              label={`${symbol} P&L`}
+              label="POSITION P&L"
               value={
                 selectedPosition
                   ? `${selectedPosition.unrealized_pnl_pct >= 0 ? "+" : ""}${selectedPosition.unrealized_pnl_pct.toFixed(2)}%`
@@ -514,7 +555,7 @@ export default function Home() {
                   <span className="pos-label">Take Profit:</span>
                   <strong className="text-lime">
                     {selectedPosition.take_profit_price
-                      ? `$${selectedPosition.take_profit_price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} (+${selectedPosition.take_profit_pct}%)`
+                      ? `$${selectedPosition.take_profit_price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} (+${selectedPosition.take_profit_pct?.toFixed(2)}%)`
                       : "None"}
                   </strong>
                 </div>
@@ -522,11 +563,12 @@ export default function Home() {
                   <span className="pos-label">Stop Loss:</span>
                   <strong className="text-coral">
                     {selectedPosition.stop_loss_price
-                      ? `$${selectedPosition.stop_loss_price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} (-${selectedPosition.stop_loss_pct}%)`
+                      ? `$${selectedPosition.stop_loss_price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} (-${selectedPosition.stop_loss_pct?.toFixed(2)}%)`
                       : "None"}
                   </strong>
                 </div>
               </div>
+              <p className="size-hint">Market value: {money(selectedPosition.market_value)} · Unrealized P&amp;L: {money(selectedPosition.unrealized_pnl)}</p>
 
               {isEditingTpSl ? (
                 <div className="tpsl-edit-box">
@@ -566,15 +608,15 @@ export default function Home() {
                   <button
                     className="exit-btn danger"
                     onClick={() => handleExecuteOrder("exit")}
-                    disabled={orderLoading}
-                    title="Instantly exit 100% of this position at current market price"
+                    disabled={orderLoading || !brokerReady}
+                    title="Submit an order to exit this position; execution is not guaranteed"
                   >
                     {orderLoading ? "Exiting..." : `Exit Position (100%)`}
                   </button>
                   <button
                     className="exit-btn secondary"
                     onClick={() => handleExecuteOrder("sell", { pct_of_position: 0.5 })}
-                    disabled={orderLoading}
+                    disabled={orderLoading || !brokerReady || (isOption && selectedPosition.quantity < 2)}
                     title="Exit 50% of this position"
                   >
                     Exit 50%
@@ -626,18 +668,11 @@ export default function Home() {
                 </button>
               </div>
               
-              <div className="order-field-row">
-                <span className="field-label">TIMEFRAME SLOT</span>
-                <div className="sizing-mode-toggle">
-                  <select value={tradeTimeframe} onChange={(e) => setTradeTimeframe(e.target.value)} style={{ padding: '6px', background: 'transparent', color: 'white', border: '1px solid var(--border)', borderRadius: '4px' }}>
-                    <option value="1m">1m</option>
-                    <option value="5m">5m</option>
-                    <option value="15m">15m</option>
-                    <option value="1h">1h</option>
-                    <option value="4h">4h</option>
-                  </select>
-                </div>
-              </div>
+              <label className="order-field-row">
+                LIMIT PRICE / SHARE OR PREMIUM (optional)
+                <input type="number" min="0.01" step="0.01" value={limitPrice} onChange={(e) => setLimitPrice(e.target.value)} placeholder={isOption ? "Fresh quote limit" : "Market order"} />
+              </label>
+              <p className="size-hint">{isOption ? `Whole contracts; multiplier ${multiplier}. Buy to open / sell to close only.` : "Shares; fractional quantities require a fractionable asset."}</p>
 
               {/* Sizing Mode Switch */}
               <div className="order-field-row">
@@ -650,10 +685,10 @@ export default function Home() {
                     USD ($)
                   </button>
                   <button
-                    className={`mode-btn ${sizingMode === "crypto" ? "active" : ""}`}
-                    onClick={() => setSizingMode("crypto")}
+                    className={sizingMode === "quantity" ? "mode-btn active" : "mode-btn"}
+                    onClick={() => setSizingMode("quantity")}
                   >
-                    {symbol.split("-")[0]} (Qty)
+                    {units} (Qty)
                   </button>
                 </div>
               </div>
@@ -672,7 +707,7 @@ export default function Home() {
                         const val = e.target.value;
                         setOrderAmountUsd(val);
                         if (price && price > 0) {
-                          setOrderQuantityCrypto((Number(val) / price).toFixed(6));
+                          setOrderQuantity(estimateQuantity(Number(val)));
                         }
                       }}
                       placeholder="Amount in USD"
@@ -683,17 +718,17 @@ export default function Home() {
                     <span className="input-prefix">{symbol.split("-")[0]}</span>
                     <input
                       type="number"
-                      min="0.000001"
-                      step="0.01"
-                      value={orderQuantityCrypto}
+                      min={isOption ? "1" : "0.000001"}
+                      step={isOption ? "1" : "0.000001"}
+                      value={orderQuantity}
                       onChange={(e) => {
                         const val = e.target.value;
-                        setOrderQuantityCrypto(val);
+                        setOrderQuantity(val);
                         if (price && price > 0) {
-                          setOrderAmountUsd((Number(val) * price).toFixed(2));
+                          setOrderAmountUsd((Number(val) * price * multiplier).toFixed(2));
                         }
                       }}
-                      placeholder={`Quantity of ${symbol.split("-")[0]}`}
+                      placeholder={`Quantity of ${symbol}`}
                     />
                   </div>
                 )}
@@ -703,11 +738,11 @@ export default function Home() {
               <div className="size-hint">
                 {sizingMode === "usd" ? (
                   <span>
-                    ≈ {price && Number(orderAmountUsd) > 0 ? (Number(orderAmountUsd) / price).toFixed(6) : "0"} {symbol.split("-")[0]}
+                    ≈ {price && Number(orderAmountUsd) > 0 ? estimateQuantity(Number(orderAmountUsd)) : "0"} {units}
                   </span>
                 ) : (
                   <span>
-                    ≈ ${price && Number(orderQuantityCrypto) > 0 ? (Number(orderQuantityCrypto) * price).toLocaleString(undefined, { maximumFractionDigits: 2 }) : "0"} USD
+                    ≈ {money(price && Number(orderQuantity) > 0 ? Number(orderQuantity) * price * multiplier : 0)} USD
                   </span>
                 )}
               </div>
@@ -751,6 +786,7 @@ export default function Home() {
                       <div className="risk-input-row">
                         <div className="input-group compact">
                           <input
+                            aria-label="Take profit percent"
                             type="number"
                             min="0.1"
                             step="0.5"
@@ -795,6 +831,7 @@ export default function Home() {
                       <div className="risk-input-row">
                         <div className="input-group compact">
                           <input
+                            aria-label="Stop loss percent"
                             type="number"
                             min="0.1"
                             step="0.5"
@@ -822,7 +859,7 @@ export default function Home() {
                 <div className="sell-info-box">
                   <p>
                     {selectedPosition && selectedPosition.quantity > 0
-                      ? `You hold ${selectedPosition.quantity.toFixed(6)} ${symbol}. Executing sell will reduce or close your position at current market price.`
+                      ? `You hold ${selectedPosition.quantity} ${units} of ${symbol}. A sell order reduces or closes the long position after fills.`
                       : `No active position for ${symbol}. Enter a quantity to exit if held.`}
                   </p>
                 </div>
@@ -832,10 +869,10 @@ export default function Home() {
               <button
                 className={`main-order-btn ${orderSide === "buy" ? "buy-action" : "sell-action"}`}
                 onClick={() => handleExecuteOrder(orderSide)}
-                disabled={orderLoading || !price}
+                disabled={orderLoading || !price || !brokerReady}
               >
                 {orderLoading
-                  ? "Executing Order..."
+                  ? "Submitting Order..."
                   : orderSide === "buy"
                   ? `Manual Buy ${symbol}`
                   : `Manual Sell / Exit ${symbol}`}
@@ -862,10 +899,10 @@ export default function Home() {
                             <div className="trade-meta-grid">
                               <div>Side: {event.trade.side.toUpperCase()}</div>
                               <div>Qty: {event.trade.quantity.toFixed(6)}</div>
-                              <div>Price: ${event.trade.price.toLocaleString()}</div>
+                              <div>Fill price: {money(event.trade.price)}</div>
                               {event.trade.tp ? <div className="text-lime">TP: ${event.trade.tp.toLocaleString()}</div> : null}
                               {event.trade.sl ? <div className="text-coral">SL: ${event.trade.sl.toLocaleString()}</div> : null}
-                              {event.trade.realized_pnl !== null ? (
+                              {event.trade.realized_pnl != null ? (
                                 <div className={event.trade.realized_pnl >= 0 ? "text-lime" : "text-coral"}>
                                   Realized P&L: ${event.trade.realized_pnl.toFixed(2)}
                                 </div>
@@ -917,23 +954,16 @@ export default function Home() {
                               ? "🎯 TAKE PROFIT"
                               : trade.is_manual
                               ? "👤 MANUAL"
-                              : "🤖 JEV AUTO"}
+                              : trade.reason === "jev" ? "JEV AUTO" : "ALPACA"}
                           </span>
                         </div>
                         <time>{new Date(trade.timestamp * 1000).toLocaleString()}</time>
                       </div>
                       <div className="position-details">
-                        <Metric label="PRICE" value={`$${trade.price.toLocaleString(undefined, { maximumFractionDigits: 2 })}`} />
+                        <Metric label="FILL PRICE" value={money(trade.price)} />
                         <Metric label="QUANTITY" value={trade.quantity.toFixed(6)} />
-                        <Metric label="ENTRY" value={`$${trade.entry_price.toLocaleString(undefined, { maximumFractionDigits: 2 })}`} />
-                        <Metric
-                          label="REALIZED P&L"
-                          value={trade.realized_pnl === null ? "Open" : `$${trade.realized_pnl.toFixed(2)}`}
-                        />
-                        <Metric
-                          label="CASH AFTER"
-                          value={`$${trade.cash_balance.toLocaleString(undefined, { maximumFractionDigits: 2 })}`}
-                        />
+                        <Metric label="STATUS" value={trade.status ?? "filled"} />
+                        <Metric label="REALIZED P&L" value={money(trade.realized_pnl)} />
                         {trade.tp ? (
                           <Metric label="TAKE PROFIT" value={`$${trade.tp.toLocaleString(undefined, { maximumFractionDigits: 2 })}`} />
                         ) : null}

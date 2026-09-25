@@ -1,9 +1,36 @@
 [project]
 name = "pipeline"
 version = "0.0.1"
+description = "Alpaca paper-trading and market-data service for Jev Trades"
+requires-python = ">=3.14"
 dependencies = [
-    "yfinance==1.7.0",
+    "alpaca-py==0.44.0",
     "pandas>=2.3.0",
-    "typesafe-sdk",
-    "alpaca-py"
+    "pydantic>=2.11,<3",
+    "python-dotenv>=1.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.pyright]
+include = ["."]
+exclude = [".venv", "__pycache__"]
+extraPaths = [".."]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.14"
+typeCheckingMode = "basic"
+
+[dependency-groups]
+dev = [
+    "pandas-stubs>=3.0.5.260914",
+    "pyright>=1.1.414",
+    "ruff>=0.16.9",
 ]

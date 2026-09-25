@@ -183,5 +183,5 @@ export default function MarketChart({
     }
   }, [position?.average_entry_price, position?.stop_loss_price, position?.take_profit_price, position?.quantity]);
 
-  return <div ref={containerRef} className="chart-shell" aria-label="BTC-USD one minute candlestick chart" />;
+  return <div ref={containerRef} className="chart-shell" aria-label="Selected instrument candlestick chart" />;
 }

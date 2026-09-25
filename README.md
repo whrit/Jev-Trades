@@ -1,226 +1,168 @@
 # Jev Trades
 
-A Next.js dashboard for live crypto market data and TypeSafe-powered paper trading.
+A Next.js dashboard for Alpaca market data and paper trading of US stocks and long calls/puts, with optional TypeSafe/Jev automation.
 
-The system streams live market data from Yahoo Finance through `yfinance`, calculates technical indicators across multiple timeframes, sends explicitly enabled trading states to TypeSafe, and applies the returned decisions to a simulated portfolio powered by a local SQLite database. It features both autonomous trading by the Jev agent and a fully-featured manual trade desk with automatic Take Profit and Stop Loss execution. No broker or live order API is connected.
-
-## See It In Action
-
-![Jev Trades making a paper trade](assets/Jev_making_trade.gif)
-
-The dashboard combines live market data, technical indicators, TypeSafe decisions, and a paper-trading portfolio in one workspace.
-
-<table>
-  <tr>
-    <td><img src="assets/trading_UI.png" alt="Jev Trades trading dashboard" /></td>
-    <td><img src="assets/portfolio_position.png" alt="Jev Trades paper portfolio position" /></td>
-  </tr>
-  <tr>
-    <td align="center"><strong>Trading UI</strong></td>
-    <td align="center"><strong>Portfolio position</strong></td>
-  </tr>
-</table>
-
-## Features
-
-- **Live Market Data & Dynamic Timeframes:** Streams live market data via Yahoo Finance websockets. The chart and technical indicators dynamically update based on the selected timeframe (1m, 5m, 15m, 1h, 4h).
-- **Autonomous Agent (Jev):** Powered by TypeSafe, the Jev autonomous decision engine analyzes the market on *every incoming tick* across all active timeframes simultaneously, providing structured judgments for trading.
-- **Paper Trading Portfolio:** Simulated trading environment with a persistent SQLite database. Capital can be dynamically adjusted through the UI, accurately updating the account ledger and portfolio equity on the fly.
-- **Automated Risk Management:** Automatic calculation and execution of Take Profit and Stop Loss triggers, determined by Jev's analysis, volatility (ATR), and user risk appetite.
-- **Manual Trade Execution:** A complete manual trading desk allowing users to execute buys and sells, set custom TP/SL targets, or exit active positions directly from the dashboard.
-- **Robust Data Handling:** Built-in safeguards to filter out delayed or out-of-order market ticks, preventing data corruption and chart crashes.
-- **Interactive UI:** Dynamic chart overlays, selectable indicator panels, and detailed historical logs for both agent decisions and executed trades.
-
-
-## Supported assets
-
-- `ADA-USD`
-- `XRP-USD`
-- `ETH-USD`
-- `BTC-USD`
-- `SOL-USD`
-- `BNB-USD`
-- `TRX-USD`
-
-The Python feed subscribes to all supported assets. The dashboard lets you select which asset to inspect and trade.
-
-## Requirements
-
-- Node.js 20 or newer
-- Python 3.12 recommended
-- A TypeSafe API key for agent decisions
+**Paper only:** `TradingClient(..., paper=True)` is fixed in the Python service. There is no live-trading switch. Orders go to Alpaca's paper brokerage; acceptance is not a fill. Alpaca—not SQLite—is authoritative for cash, positions, fills, exercise/assignment effects, and buying power.
 
 ## Setup
 
+Requirements: Node.js 20.9+, pnpm, uv, and an Alpaca paper account. Python 3.14 is selected by `pipeline/.python-version`; `pyproject.toml` requires Python 3.14+. The SDK is pinned to `alpaca-py==0.44.0`.
+
+From the repository root, for a fresh checkout:
+
+```sh
+pnpm install
+uv sync --project pipeline --locked
+cp .env.example .env.local
+cp pipeline/.env.example pipeline/.env
+```
+
+Edit `pipeline/.env` to set `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` from a **paper** account. The example includes stock/option symbols, data feeds, optional TypeSafe credentials, and local listener/origin settings. Blank credentials leave trading unavailable. Existing shell variables take precedence over `pipeline/.env`.
+
+The root `.env.local` contains only public dashboard feed URLs. Its example keeps the local defaults; `NEXT_PUBLIC_MARKET_STREAM_URL` is an optional override of the feed URL plus `/stream`. Restart Next.js after changing these values. Do not overwrite existing environment files when upgrading.
+
+`TYPESAFE_AI_API_KEY` is also accepted. Manual trading and data do not require TypeSafe. Never put broker or TypeSafe secrets in `NEXT_PUBLIC_*` variables. The dashboard's optional TypeSafe key field changes the current process's key without writing it to disk.
+
+Start from the repository root in separate terminals:
+
+```sh
+uv run --project pipeline --locked python -m pipeline.data_collector
+```
+
+```sh
+pnpm dev
+```
+
+Open `http://localhost:3000`. The feed defaults to `http://127.0.0.1:8765`. Missing credentials and broker/data errors are visible in the dashboard; there is no simulated cash or synthetic-price fallback.
+
+### Python dependency workflow
+
+`pipeline/pyproject.toml` and `pipeline/uv.lock` are the dependency sources of truth; no parallel `requirements.txt` is needed. This is a non-packaged service (`tool.uv.package = false`), not a library to publish. Commit both files when dependencies change.
+
+- Runtime dependencies: Alpaca SDK, pandas, Pydantic 2, and python-dotenv. TypeSafe uses the existing HTTP integration, so its unused SDK dependency was removed.
+- Development group: Ruff for lint/import sorting and formatting; Pyright in basic mode; pandas-stubs for meaningful dataframe type checking. Pyright uses Node.js, already required by the dashboard.
+- Add runtime dependencies with `uv add --project pipeline <package>`; use `--dev` for development tools. Use `uv remove --project pipeline <package>` to remove a dependency. These commands update the lockfile.
+- Normal `uv sync` includes development tools. For runtime-only installs, use `uv sync --project pipeline --locked --no-dev` and include `--no-dev` in the `uv run` startup command too.
+- For editor type checking, select `pipeline/.venv/bin/python`; tool settings live in `pipeline/pyproject.toml`.
+
+
+## Stocks and options
+
+- Stock symbols come from `ALPACA_STOCK_SYMBOLS`.
+- `ALPACA_OPTION_SYMBOLS` is a comma-separated list of actual Alpaca OCC contract symbols. Configure specific, unexpired contracts and restart the feed. No expired contract is silently rolled to a new one.
+- Long calls and puts only: **buy to open / sell to close**, integer contract quantities, no short options, spreads, futures, or other derivative products.
+- Long options require the paper account's effective options trading level to be at least 2. Alpaca also enforces expiration-day cutoffs and contract tradability.
+- Contract size comes from Alpaca contract metadata. A standard $2 premium with a 100-share multiplier costs $200 per contract. Dollar allocations round down to whole contracts; an allocation below one contract is rejected.
+
+Discover contracts through the read-only endpoint, using a real future expiration date:
+
+```sh
+curl 'http://127.0.0.1:8765/contracts?underlying=SPY&expiration=2026-12-18'
+```
+
+The response includes `option_contracts` and `next_page_token`. Pass `page_token` to fetch subsequent pages. Select a returned tradable symbol for `ALPACA_OPTION_SYMBOLS`; the date above is illustrative, not a promise of availability or a trading recommendation.
+
+## Market data
+
+Both stocks and options use Alpaca's historical data clients:
+
+- Latest bid/ask quotes are polled every five seconds; the displayed price is their midpoint.
+- Completed one-minute OHLCV bars are polled every minute. Startup requests up to 1,000 recent bars per symbol from the preceding seven days; subsequent polls refresh the last five minutes.
+- Broker-provided bar timestamps are upsert keys. Corrections replace bars instead of double-counting volume. Quotes never fabricate candles or trade volume.
+- Charts support 1m, 5m, 15m, 1h, and 4h aggregation, existing moving averages, oscillators, and TP/SL overlays. Sparse or insufficient history displays warming indicators.
+- Cached bars are stored in `pipeline/alpaca_market_data/`. Cached or stale data is not represented as a live quote.
+
+This implementation uses REST polling, not WebSocket streams. Five-second polling is not tick-level execution or a guaranteed exit latency. Broker/network delays add to that interval.
+
+`ALPACA_STOCK_FEED=iex` is the default; use `sip` only with the necessary entitlement. IEX is not the consolidated market. Options default to `indicative`; `opra` requires the corresponding entitlement. Indicative options quotes are not executable OPRA/NBBO quotes, and indicative trades may be delayed. Historical option bars use the SDK's historical options endpoint, whose request has no feed selector. Entitlements and historical availability differ from equities; the SDK's general stock history statement does not guarantee five years of option history.
+
+Orders require a quote no more than 30 seconds old and an open regular market session. Automated decisions require a newly completed bar no more than three minutes old. Delayed subscriptions, quiet contracts, closed markets, and stale quotes can therefore prevent trading rather than bypass these guards.
+
+## Paper trading workflow
+
+1. Select a configured stock or option contract.
+2. Set the **strategy budget**, maximum position percentage, and risk profile. Budget changes do **not** deposit, withdraw, reset, or otherwise change Alpaca cash. The budget covers long holdings plus estimated unfilled buy exposure across symbols; market movements and actual fill prices can exceed these estimates.
+3. Apply settings. Manual orders remain independent of the automation toggle.
+4. Submit a manual buy/sell, or explicitly confirm starting Jev automation for the selected symbol.
+5. Monitor **Broker orders** for acceptance, partial fills, rejection, expiration, and cancellation. A cancel request is not a confirmed cancellation.
+
+Stocks use DAY market orders unless a limit price is supplied. Fractional shares require a fractionable asset. Options always use DAY limit orders, with an explicit premium limit or the current quote rounded to cents. Market-order slippage can exceed an estimated stock allocation; limits can remain unfilled. Submitted quantities are checked against current cash, buying power, the strategy's per-symbol position cap, and available long holdings. Sells cannot intentionally open a short position.
+
+All analysis timeframes share **one net broker position per symbol**. Manual orders, Jev orders, and broker-side changes appear in the same portfolio. Do not use timeframe labels as independent position allocations. Use a dedicated Alpaca paper account for this application, and run only one feed process against it.
+
+### Jev automation
+
+Automation starts disabled. Both configured stocks and configured long option contracts are eligible once enabled. Jev analyzes the selected instrument's own candles/premiums, not an automatically selected option chain or an underlying-to-options strategy.
+
+New completed timeframe bars trigger decisions. A bounded queue avoids an unbounded tick backlog; work older than two minutes is discarded. Risk profile, confidence thresholds, allocation fractions, and ATR-based sizing/exit distances gate decisions. Stopping automation or changing configuration invalidates pending/in-flight decisions before submission. It does **not** cancel already submitted broker orders or disable local exit monitoring.
+
+The TypeSafe request contains the selected instrument's indicators, position, and account balances. Enable automation only if you intend to send that trading context to TypeSafe.
+
+### TP/SL limitations
+
+TP/SL values are **local monitored exit targets**, not broker-hosted bracket/OCO protection. They are evaluated against fresh bid quotes while the feed process runs, including while Jev is paused. No exit runs while the service is down, market data is unavailable, or the regular session is closed. Options exits are limit orders and can remain unfilled after a stop is crossed.
+
+Targets attach only after a confirmed buy fill, including a partial fill. If a target is crossed during a partially filled buy, the service requests cancellation of the remaining buy, waits for broker confirmation, then can sell the held quantity. Pending sells prevent duplicate exits. There is no guarantee of execution at a stop price.
+
+Review expiring options in Alpaca directly: exercise/assignment and expiry are broker-controlled. This application does not automatically roll contracts or manage delivery of underlying shares.
+
+## State and history
+
+- `pipeline/alpaca_paper.db`: durable submission intents/client IDs, observed broker order states, local exit targets, and agent decisions. Not a second cash ledger.
+- Orders with uncertain submission outcomes remain blocked by symbol until reconciled with Alpaca using their persisted client order ID. They are not blindly resubmitted. If an unknown order cannot be found, inspect the paper account and resolve the discrepancy before altering local state.
+- Broker reconciliation polls every three seconds and resumes after restart. The dashboard shows the latest 100 observed orders/fill summaries; each order's filled quantity and average price are cumulative, not individual execution events.
+- Per-trade realized P&L/cash-after values are not invented. Position value and unrealized P&L come directly from Alpaca; consult Alpaca for its complete ledger/tax-lot accounting.
+- The old `pipeline/jev_trades.db` is retained untouched for reference. Simulated crypto holdings/cash are **not migrated into broker orders**.
+
+Keep the SQLite database: submission intents and exit targets must survive a restart even though Alpaca owns the actual ledger. Preserve it when restarting/upgrading; stop the feed before copying the database and any remaining WAL files for a backup. Credentials and runtime strategy settings are not persisted there, and automation always restarts disabled.
+
+OHLCV files are a rebuildable cache, not an audit ledger. A separate SQL market-data archive is unnecessary for the current dashboard; add one only for durable backtesting/history requirements. There is no automatic retention policy for persisted order and decision history.
+
+## HTTP service and security
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /stream?symbol=SPY&timeframe=1m` | Dashboard SSE snapshot |
+| `GET /health` | Broker connectivity/error status |
+| `GET /history` | Broker-derived order/fill summaries and account snapshot |
+| `GET /contracts?underlying=SPY&expiration=YYYY-MM-DD` | Paginated contract discovery |
+| `POST /config` | Strategy budget, risk, active timeframes, selected symbol, automation |
+| `POST /order` | `buy`, `sell`, `exit`, `update_tp_sl`, or `cancel` |
+
+Order requests use the configured `symbol`, `quantity` **or** `amount_usd` for buys, optional `limit_price`, and optional `stop_loss_pct` / `take_profit_pct` or absolute targets. Sell requests accept `quantity` or `pct_of_position`; `exit` sells all available long holdings. `cancel` requires `order_id`. Zero TP/SL values in `update_tp_sl` remove the corresponding local target.
+
+Pydantic validates both mutation payloads: unknown fields, numeric strings/booleans, non-finite numbers, invalid actions, and malformed settings are rejected with HTTP 400 before mutation. Validation responses omit submitted input values to avoid echoing credentials. Broker-specific sizing, permissions, market-session, and quote-freshness checks remain in the execution layer.
+
+The service binds to loopback by default. Browser origins are restricted to `http://localhost:3000` and `http://127.0.0.1:3000`; override with comma-separated `FEED_ALLOWED_ORIGINS` if necessary. Mutations require bounded JSON requests. `HOST` and `PORT` configure the listener.
+
+**There is no multi-user authentication or authorization.** CORS is not authentication. Do not expose this shared paper-account service to a public network. Remote deployment requires an authenticated HTTPS reverse proxy and a deliberate origin allowlist. `NEXT_PUBLIC_MARKET_FEED_URL` changes the dashboard feed URL, not the Alpaca broker URL. Vercel can host the dashboard, not the long-running Python feed.
+
+## Verification
+
 From the repository root:
 
-```powershell
-cd "C:\Users\Local User\OneDrive\Desktop\jev-trades"
-
-.venv\Scripts\python.exe -m pip install -r pipeline\requirements.txt
-npm install
+```sh
+uv sync --project pipeline --locked
+uv run --project pipeline --locked ruff check pipeline
+uv run --project pipeline --locked ruff format --check pipeline
+uv run --project pipeline --locked pyright --project pipeline/pyproject.toml
+uv run --project pipeline --locked python -m unittest discover -s pipeline -v
+pnpm exec next typegen
+pnpm exec tsc --noEmit
+pnpm build
 ```
 
-The project uses the root `.venv`. Do not use the older `pipeline\venv` environment.
+The four offline regressions use temporary storage and controlled broker transitions. They exercise contract sizing and aggregate budget limits, partial fills, restart reconciliation, oversell/fractional-option rejection, stale/invalid inputs, pending-order suppression, ambiguous submission recovery, partial-fill stop exits while automation is paused, corrected candle volumes/time buckets, and HTTP validation without secret disclosure or partial configuration changes. No account credentials or real broker orders are used.
 
-Create `pipeline/.env` and add your TypeSafe key. Both names are accepted:
+## References
 
-```text
-TYPESAFE_AI_API_KEY=your_key_here
-```
+- [Alpaca-py market data](https://alpaca.markets/sdks/python/market_data.html)
+- [Alpaca-py trading](https://alpaca.markets/sdks/python/trading.html)
+- [Alpaca-py options examples](https://github.com/alpacahq/alpaca-py/tree/master/examples/options)
+- [Alpaca-py Context7 documentation](https://context7.com/alpacahq/alpaca-py)
 
-or:
+## Contributing and license
 
-```text
-TYPESAFE_API_KEY=your_key_here
-```
+Contributions: https://github.com/zadescoxp/Jev-Trades
 
-Keep this file server-side and never expose the key through `NEXT_PUBLIC_*` variables.
-
-The dashboard also has an optional `TYPESAFE KEY` field. A visitor can enter their own key and click `Apply portfolio`; the key is sent to the Python feed over its configuration endpoint and kept in that process memory only. It is not stored in the browser or written to agent logs. Do not use this pattern for a shared public trading account: the current Python service has one shared in-memory paper portfolio and one active key for all connected dashboard users.
-
-## Vercel deployment
-
-Vercel can host the Next.js dashboard, but it cannot host this whole application by itself. The Python collector is a long-running process that owns the Yahoo websocket, SSE stream, paper portfolio, and local JSONL files. Run that service on a separate always-on host such as Railway, Render, Fly.io, or a VPS, then set this Vercel environment variable to its public base URL:
-
-```text
-NEXT_PUBLIC_MARKET_FEED_URL=https://your-feed.example.com
-```
-
-The feed must allow the Vercel origin through CORS and expose `/stream` and `/config` over HTTPS. The current local JSONL storage and in-memory portfolio are not suitable for a multi-instance production deployment; use a database or a single pinned worker if that state needs to persist.
-
-## Contributing
-
-Contributions are welcome. Open an issue for bugs or ideas, or fork the repository and open a pull request:
-
-https://github.com/zadescoxp/Jev-Trades
-
-Before opening a pull request, run:
-
-```bash
-npm run lint
-npm run build
-python3 -m py_compile pipeline/data_collector.py pipeline/paper_trader.py pipeline/schema.py
-```
-
-## License
-
-Jev Trades is released under the Apache License 2.0. See [LICENSE](LICENSE) for the full license text.
-
-## Run the application
-
-Use two terminals.
-
-### Terminal 1: market and paper-trading feed
-
-```powershell
-cd "C:\Users\Local User\OneDrive\Desktop\jev-trades"
-.venv\Scripts\python.exe pipeline\data_collector.py
-```
-
-The Python service listens on:
-
-- Stream: `http://127.0.0.1:8765/stream`
-- Health: `http://127.0.0.1:8765/health`
-- Configuration: `http://127.0.0.1:8765/config`
-
-### Terminal 2: dashboard
-
-```powershell
-cd "C:\Users\Local User\OneDrive\Desktop\jev-trades"
-npm run dev
-```
-
-Open `http://localhost:3000`.
-
-Only run one Python feed process at a time. Multiple collectors create duplicate websocket subscriptions and duplicate agent decisions.
-
-## Trading workflow
-
-1. Select an asset.
-2. Enter the paper-trading capital.
-3. Set the maximum wallet position percentage.
-4. Choose a risk profile:
-   - `Conservative`: higher confidence threshold and smaller allocation multiplier.
-   - `Balanced`: standard confidence and allocation behavior.
-   - `Aggressive`: lower confidence threshold and larger allocation multiplier.
-5. Click `Apply portfolio`.
-6. Click `Start trading <asset>`.
-
-Changing the selected asset automatically stops trading. The new asset must be started explicitly.
-
-Market data continues to stream while trading is stopped, but TypeSafe decisions are not submitted and no paper positions are changed.
-
-## Paper portfolio
-
-The account is simulated and starts with the capital entered in the dashboard. The portfolio supports multiple simultaneous positions across supported assets.
-
-Python enforces the hard limits:
-
-- Shared available cash
-- Maximum wallet position percentage
-- Risk-profile allocation multiplier
-- Confidence threshold for buy and sell actions
-
-TypeSafe returns structured judgments. It does not directly execute orders or choose arbitrary capital amounts.
-
-## Indicators
-
-The feed calculates the configured moving averages and oscillators from completed OHLCV candles, including:
-
-- EMA and SMA periods 10, 20, 30, 50, 100, and 200
-- Ichimoku base line
-- VWMA 20
-- Hull MA 9
-- RSI 14
-- Stochastic %K
-- CCI 20
-- ADX 14
-- Awesome Oscillator
-- Momentum 10
-- MACD 12/26
-- Stochastic RSI
-- Williams %R
-- Bull/Bear Power
-- Ultimate Oscillator
-
-The dashboard provides selectable indicator values and EMA/SMA chart overlays.
-
-## History and logs
-
-Historical one-minute candles are warmed from yfinance and merged with local completed-candle storage under:
-
-```text
-pipeline/market_data/
-```
-
-Agent request/response events are written to:
-
-```text
-pipeline/agent_log.jsonl
-```
-
-The dashboard's `Agent logs` tab shows the request sent to TypeSafe and the response received. The `Positions` tab shows executed paper buys and sells with price, quantity, entry price, realized P&L, and cash after the trade.
-
-## Validation commands
-
-```powershell
-npm run lint
-npm run build
-.venv\Scripts\python.exe -m py_compile pipeline\data_collector.py pipeline\paper_trader.py pipeline\schema.py
-```
-
-## Project structure
-
-```text
-app/
-  page.tsx              Dashboard and portfolio controls
-  market-chart.tsx      Lightweight Charts client component
-  globals.css           Dashboard styling
-pipeline/
-  data_collector.py     yfinance history, websockets, indicators, SSE, configuration
-  paper_trader.py       TypeSafe decisions and paper portfolio ledger
-  schema.py             TypeSafe state questions
-  requirements.txt      Python dependencies
-  market_data/          Local per-asset candle history
-```
+Apache License 2.0; see [LICENSE](LICENSE).

@@ -32,6 +32,7 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.example
 
 # vercel
 .vercel
@@ -42,3 +43,9 @@ next-env.d.ts
 /venv
 */__pycache__/
 *.jsonl
+
+# Local Alpaca state (legacy simulation database is retained)
+pipeline/alpaca_paper.db*
+pipeline/alpaca_market_data/
+.venv/
+.ruff_cache/

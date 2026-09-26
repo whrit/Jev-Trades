@@ -12,8 +12,10 @@ import {
 } from "@/components/ui/collapsible";
 import {
   clock,
+  CRYPTO_TAKER_FEE,
   isCryptoTicker,
   money,
+  priceDecimals,
   qty,
   type AssetMode,
   type OptionScan,
@@ -75,15 +77,66 @@ export function Watchlist({
           <>
             <Group title="Pairs" enabled={scope?.crypto_enabled}>
               {scope?.crypto_symbols.length ? (
-                scope.crypto_symbols.map((ticker) => (
-                  <Row key={ticker} {...row(ticker)} label={ticker}>
-                    {scope.crypto_enabled && scope.crypto_symbol === ticker ? (
-                      <span className="text-primary">Strategy</span>
-                    ) : (
-                      "24/7"
-                    )}
-                  </Row>
-                ))
+                scope.crypto_symbols.map((ticker) => {
+                  const quote = snapshot?.crypto?.quotes[ticker];
+                  const price = quote?.price;
+                  const change =
+                    price && quote?.prev_close
+                      ? ((price - quote.prev_close) / quote.prev_close) * 100
+                      : null;
+                  const spreadBps =
+                    quote?.bid && quote.ask
+                      ? ((quote.ask - quote.bid) /
+                          ((quote.ask + quote.bid) / 2)) *
+                        10_000
+                      : null;
+                  const minSize = snapshot?.instruments[ticker]?.min_order_size;
+                  return (
+                    <Row
+                      key={ticker}
+                      {...row(ticker)}
+                      label={
+                        <span className="flex flex-col">
+                          {ticker}
+                          <span
+                            className="text-[0.625rem] font-normal text-muted-foreground"
+                            title="Bid/ask spread and fee-inclusive minimum order"
+                          >
+                            {spreadBps == null
+                              ? "no quote"
+                              : `spr ${spreadBps.toFixed(1)}bp`}
+                            {minSize && price
+                              ? ` · min ${money(minSize * price * (1 + CRYPTO_TAKER_FEE))}`
+                              : ""}
+                          </span>
+                        </span>
+                      }
+                    >
+                      <span className="flex flex-col items-end">
+                        <span className="text-foreground">
+                          {money(
+                            price,
+                            priceDecimals(snapshot?.instruments[ticker]),
+                          )}
+                        </span>
+                        <span
+                          className={cn(
+                            change == null
+                              ? ""
+                              : change >= 0
+                                ? "text-up"
+                                : "text-down",
+                          )}
+                          title="Change vs previous UTC daily close"
+                        >
+                          {change == null
+                            ? "--"
+                            : `${change >= 0 ? "+" : ""}${change.toFixed(2)}%`}
+                        </span>
+                      </span>
+                    </Row>
+                  );
+                })
               ) : (
                 <Empty>Add pairs in Settings.</Empty>
               )}

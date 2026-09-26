@@ -92,9 +92,13 @@ export function TopBar({
         <Stat label="Cash" value={money(account?.available_cash)} />
         {assetMode === "crypto" ? (
           <Stat
-            label="Crypto BP"
-            value={money(account?.crypto_buying_power)}
-            hint={account?.crypto_status ?? "Not connected"}
+            label="Crypto exp."
+            value={money(account?.crypto_exposure)}
+            hint={`of ${money(
+              optionCapital === null || !snapshot?.crypto
+                ? null
+                : optionCapital * snapshot.crypto.policy.max_total_pct,
+            )} cap · held + reserved · buying power ${money(account?.crypto_buying_power)}`}
           />
         ) : (
           <Stat
@@ -152,7 +156,9 @@ export function TopBar({
                 <>
                   <span className="text-muted-foreground">Crypto</span>
                   <span>
-                    {scope?.crypto_enabled ? scope.crypto_symbol : "Off"}
+                    {scope?.crypto_enabled
+                      ? scope.crypto_symbols.join(", ")
+                      : "Off"}
                   </span>
                 </>
               ) : (

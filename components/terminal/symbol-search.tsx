@@ -28,10 +28,10 @@ export function SymbolSearch({
   onSelect: (ticker: string) => void;
 }) {
   const scope = snapshot?.trading_scope;
-  const strategy =
+  const automated = (ticker: string) =>
     assetMode === "crypto"
-      ? scope?.crypto_enabled && scope.crypto_symbol
-      : scope?.stock_enabled && scope.stock_symbol;
+      ? !!scope?.crypto_enabled && scope.crypto_symbols.includes(ticker)
+      : !!scope?.stock_enabled && scope.stock_symbol === ticker;
   const held = snapshot?.trading.account.positions ?? {};
 
   return (
@@ -61,7 +61,7 @@ export function SymbolSearch({
                 >
                   <span className="font-medium">{ticker}</span>
                   <span className="ml-auto flex gap-2 font-sans text-muted-foreground">
-                    {ticker === strategy && (
+                    {automated(ticker) && (
                       <span className="text-primary">Strategy</span>
                     )}
                     {held[ticker]?.quantity > 0 && <span>Held</span>}

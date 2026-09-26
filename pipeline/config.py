@@ -52,7 +52,7 @@ class TradingScope(BaseModel):
     stock_enabled: bool = Field(default_factory=lambda: bool(STOCK_SYMBOLS))
     options_enabled: bool = Field(default_factory=lambda: bool(OPTION_UNDERLYINGS))
     crypto_symbols: tuple[str, ...] = Field(default_factory=lambda: CRYPTO_SYMBOLS)
-    crypto_symbol: str = Field(default_factory=lambda: next(iter(CRYPTO_SYMBOLS), ""))
+    # Crypto automation evaluates every watchlist pair, like options scans every underlying.
     crypto_enabled: bool = False
 
     @field_validator("stock_symbols", "option_underlyings", mode="before")
@@ -75,7 +75,7 @@ class TradingScope(BaseModel):
             raise ValueError("Use USD-quoted crypto pairs such as BTC/USD")
         return normalized
 
-    @field_validator("stock_symbol", "crypto_symbol")
+    @field_validator("stock_symbol")
     @classmethod
     def normalize_stock(cls, value: str) -> str:
         return value.strip().upper()
@@ -88,10 +88,8 @@ class TradingScope(BaseModel):
             raise ValueError("Select a stock strategy symbol or turn stock automation off")
         if self.options_enabled and not self.option_underlyings:
             raise ValueError("Add option underlyings or turn options automation off")
-        if self.crypto_symbol and self.crypto_symbol not in self.crypto_symbols:
-            raise ValueError("Crypto strategy symbol must belong to the crypto watchlist")
-        if self.crypto_enabled and not self.crypto_symbol:
-            raise ValueError("Select a crypto strategy symbol or turn crypto automation off")
+        if self.crypto_enabled and not self.crypto_symbols:
+            raise ValueError("Add crypto pairs or turn crypto automation off")
         return self
 
 
@@ -134,6 +132,32 @@ OPTIONS = OptionPolicy.model_validate(
         field: os.environ[f"OPTION_{field.upper()}"]
         for field in OptionPolicy.model_fields
         if f"OPTION_{field.upper()}" in os.environ
+    }
+)
+
+
+class CryptoPolicy(BaseModel):
+    """Automated crypto entry limits; fractions of min(strategy budget, broker equity)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
+
+    max_trade_pct: float = Field(default=0.10, gt=0, le=1)
+    max_pair_pct: float = Field(default=0.25, gt=0, le=1)
+    max_total_pct: float = Field(default=0.50, gt=0, le=1)
+    min_confidence: float = Field(default=0.60, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def valid_ranges(self) -> Self:
+        if not self.max_trade_pct <= self.max_pair_pct <= self.max_total_pct:
+            raise ValueError("Require crypto trade cap <= pair cap <= total cap")
+        return self
+
+
+CRYPTO = CryptoPolicy.model_validate(
+    {
+        field: os.environ[f"CRYPTO_{field.upper()}"]
+        for field in CryptoPolicy.model_fields
+        if f"CRYPTO_{field.upper()}" in os.environ
     }
 )
 

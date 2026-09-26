@@ -42,6 +42,9 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS trading_scope (
                 id INTEGER PRIMARY KEY CHECK (id = 1), payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS crypto_policy (
+                id INTEGER PRIMARY KEY CHECK (id = 1), payload TEXT NOT NULL
+            );
         """)
 
 
@@ -92,7 +95,17 @@ def get_trading_scope() -> dict[str, Any]:
         return json.loads(row[0]) if row else {}
 
 
-def save_configuration(policy: dict[str, Any] | None, scope: dict[str, Any] | None) -> None:
+def get_crypto_policy() -> dict[str, Any]:
+    with get_connection() as conn:
+        row = conn.execute("SELECT payload FROM crypto_policy WHERE id = 1").fetchone()
+        return json.loads(row[0]) if row else {}
+
+
+def save_configuration(
+    policy: dict[str, Any] | None,
+    scope: dict[str, Any] | None,
+    crypto_policy: dict[str, Any] | None = None,
+) -> None:
     with get_connection() as conn:
         if policy is not None:
             conn.execute(
@@ -100,3 +113,7 @@ def save_configuration(policy: dict[str, Any] | None, scope: dict[str, Any] | No
             )
         if scope is not None:
             conn.execute("INSERT OR REPLACE INTO trading_scope VALUES (1, ?)", (json.dumps(scope),))
+        if crypto_policy is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO crypto_policy VALUES (1, ?)", (json.dumps(crypto_policy),)
+            )

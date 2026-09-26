@@ -34,7 +34,6 @@ class CryptoData(unittest.TestCase):
             stock_symbol="",
             stock_enabled=False,
             crypto_symbols=("BTC/USD",),
-            crypto_symbol="BTC/USD",
             crypto_enabled=True,
         )
         for name, value in (("TRADER", self.trader), ("STORE_DIR", self.directory / "bars")):
@@ -47,10 +46,9 @@ class CryptoData(unittest.TestCase):
 
     def test_crypto_scope_cannot_cross_asset_classes_or_enable_empty_strategy(self):
         scope = config.TradingScope.model_validate(
-            {"crypto_symbols": [" btc/usd ", "BTC/USD", "eth/usd"], "crypto_symbol": "btc/usd"}
+            {"crypto_symbols": [" btc/usd ", "BTC/USD", "eth/usd"]}
         )
         self.assertEqual(scope.crypto_symbols, ("BTC/USD", "ETH/USD"))
-        self.assertEqual(scope.crypto_symbol, "BTC/USD")
         self.assertFalse(scope.crypto_enabled)
         for values in (
             {"crypto_symbols": ["BTCUSD"]},
@@ -59,7 +57,7 @@ class CryptoData(unittest.TestCase):
             {"stock_symbols": ["BTC/USD"]},
             {"option_underlyings": ["BTC/USD"]},
             {"crypto_enabled": True},
-            {"crypto_symbols": ["BTC/USD"], "crypto_symbol": "ETH/USD"},
+            {"crypto_symbols": ["BTC/USD"], "crypto_symbol": "BTC/USD"},  # removed field
         ):
             with self.subTest(values=values), self.assertRaises(ValidationError):
                 config.TradingScope.model_validate(values)

@@ -15,6 +15,14 @@ class OptionPolicyPatch(TypedDict, total=False):
     min_confidence: Annotated[float, Field(ge=0, le=1)]
 
 
+@with_config(ConfigDict(strict=True, extra="forbid", allow_inf_nan=False))
+class CryptoPolicyPatch(TypedDict, total=False):
+    max_trade_pct: Annotated[float, Field(gt=0, le=1)]
+    max_pair_pct: Annotated[float, Field(gt=0, le=1)]
+    max_total_pct: Annotated[float, Field(gt=0, le=1)]
+    min_confidence: Annotated[float, Field(ge=0, le=1)]
+
+
 @with_config(ConfigDict(strict=True, extra="forbid"))
 class TradingScopePatch(TypedDict, total=False):
     stock_symbols: list[str]
@@ -23,7 +31,6 @@ class TradingScopePatch(TypedDict, total=False):
     stock_enabled: bool
     options_enabled: bool
     crypto_symbols: list[str]
-    crypto_symbol: str
     crypto_enabled: bool
 
 
@@ -35,8 +42,10 @@ class ConfigPayload(TypedDict, total=False):
     capital: PositiveFloat
     max_wallet_position_pct: Annotated[float, Field(gt=0, le=1)]
     risk_appetite: Literal["conservative", "balanced", "aggressive"]
+    crypto_risk_appetite: Literal["conservative", "balanced", "aggressive"]
     typesafe_api_key: str
     option_policy: OptionPolicyPatch
+    crypto_policy: CryptoPolicyPatch
 
 
 @with_config(ConfigDict(strict=True, extra="forbid", allow_inf_nan=False))

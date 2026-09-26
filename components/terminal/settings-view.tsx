@@ -39,6 +39,7 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import {
   errorText,
   feedBase,
+  cryptoPolicyFields,
   money,
   optionPolicyFields,
   postFeed,
@@ -46,7 +47,7 @@ import {
   type AssetMode,
   type ConfigResult,
   type OptionPolicy,
-  type OptionPolicyKey,
+  type PolicyField,
   type Snapshot,
 } from "@/lib/terminal";
 import { cn } from "@/lib/utils";
@@ -104,16 +105,51 @@ export function SettingsView({
         </div>
         {assetMode === "equities" && options && (
           <>
-            <OptionLimits
-              snapshot={snapshot}
-              tradingEnabled={tradingEnabled}
-              onConfigSaved={onConfigSaved}
-            />
+            {editablePolicy(options.policy) ? (
+              <PolicyLimits
+                title="Options risk limits"
+                scopeRow={["Underlyings", options.underlyings.join(", ")]}
+                fields={optionPolicyFields}
+                policy={options.policy}
+                payloadKey="option_policy"
+                notes={["Per-ticker exposure includes stock exposure."]}
+                footnote="Multiple distinct long calls/puts are allowed; adding to the same contract is not. Confidence gates discretionary options trades, not protective exits. Lower limits block new exposure and never force liquidation."
+                snapshot={snapshot}
+                tradingEnabled={tradingEnabled}
+                onConfigSaved={onConfigSaved}
+              />
+            ) : (
+              <Card size="sm">
+                <CardContent className="text-muted-foreground">
+                  The feed process needs a restart to support editable options
+                  limits. Restart when ready; automation will start paused.
+                </CardContent>
+              </Card>
+            )}
             <AdvancedPolicy
               policy={options.policy}
               editable={editablePolicy(options.policy)}
             />
           </>
+        )}
+        {assetMode === "crypto" && snapshot?.crypto && (
+          <PolicyLimits
+            title="Crypto risk limits"
+            scopeRow={[
+              "Pairs",
+              snapshot.trading_scope?.crypto_symbols.join(", ") || "None",
+            ]}
+            fields={cryptoPolicyFields}
+            policy={snapshot.crypto.policy}
+            payloadKey="crypto_policy"
+            notes={[
+              "Limits cap automated crypto entries only; manual orders use the budget and per-symbol cap.",
+            ]}
+            footnote="Exposure counts held value plus pending buys including the 0.25% taker-fee allowance. Confidence gates automated crypto entries and exits, not protective TP/SL exits. Lower limits block new exposure and never force liquidation."
+            snapshot={snapshot}
+            tradingEnabled={tradingEnabled}
+            onConfigSaved={onConfigSaved}
+          />
         )}
       </div>
     </div>
@@ -154,6 +190,7 @@ function StrategySettings({
     capital: string;
     maxPosition: string;
     risk: string;
+    cryptoRisk: string;
     frames: string[];
   }> | null>(null);
   const [typeSafeKey, setTypeSafeKey] = useState("");
@@ -163,6 +200,9 @@ function StrategySettings({
     draft?.maxPosition ??
     String((snapshot?.settings.max_wallet_position_pct ?? 0.75) * 100);
   const risk = draft?.risk ?? snapshot?.settings.risk_appetite ?? "balanced";
+  const cryptoRisk =
+    draft?.cryptoRisk ?? snapshot?.settings.crypto_risk_appetite ?? "balanced";
+  const crypto = assetMode === "crypto";
   const frames = draft?.frames ?? snapshot?.settings.active_timeframes ?? [];
   const dirty = !!draft || !!typeSafeKey;
   const edit = (patch: NonNullable<typeof draft>) =>
@@ -176,7 +216,8 @@ function StrategySettings({
       rows: [
         ["Budget", money(Number(capital))],
         ["Per-symbol cap", `${maxPosition}%`],
-        ["Stock risk", risk],
+        ["Stock risk profile", risk],
+        ["Crypto risk profile", cryptoRisk],
         ["Evaluation", frames.join(", ")],
         [
           "Automation",
@@ -203,6 +244,7 @@ function StrategySettings({
             capital: Number(capital),
             max_wallet_position_pct: Number(maxPosition) / 100,
             risk_appetite: risk,
+            crypto_risk_appetite: cryptoRisk,
             active_timeframes: frames,
             typesafe_api_key: key || undefined,
           },
@@ -275,24 +317,33 @@ function StrategySettings({
                   <InputGroupAddon align="inline-end">%</InputGroupAddon>
                 </InputGroup>
               </div>
-              {assetMode === "equities" && (
-                <div className="grid gap-1.5">
-                  <Label htmlFor={`${ids}-risk`}>Stock risk</Label>
-                  <Select
-                    value={risk}
-                    onValueChange={(value) => edit({ risk: value })}
-                  >
-                    <SelectTrigger id={`${ids}-risk`} className="w-full">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="conservative">Conservative</SelectItem>
-                      <SelectItem value="balanced">Balanced</SelectItem>
-                      <SelectItem value="aggressive">Aggressive</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-              )}
+              <div className="grid gap-1.5">
+                <Label
+                  htmlFor={`${ids}-risk`}
+                  title={
+                    crypto
+                      ? "Sets allocation and ATR stop width for the crypto strategy. Its confidence minimum is in Crypto risk limits."
+                      : "Sets the confidence threshold, allocation, and ATR stop width for the stock strategy. Options use their own limits."
+                  }
+                >
+                  {crypto ? "Crypto risk" : "Stock risk"}
+                </Label>
+                <Select
+                  value={crypto ? cryptoRisk : risk}
+                  onValueChange={(value) =>
+                    edit(crypto ? { cryptoRisk: value } : { risk: value })
+                  }
+                >
+                  <SelectTrigger id={`${ids}-risk`} className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="conservative">Conservative</SelectItem>
+                    <SelectItem value="balanced">Balanced</SelectItem>
+                    <SelectItem value="aggressive">Aggressive</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
             </div>
             <div className="grid gap-1.5">
               <Label id={`${ids}-frames`}>Evaluation intervals</Label>
@@ -381,43 +432,40 @@ function StrategySettings({
   );
 }
 
-function OptionLimits({
+function PolicyLimits({
+  title,
+  scopeRow,
+  fields,
+  policy: saved,
+  payloadKey,
+  notes,
+  footnote,
   snapshot,
   tradingEnabled,
   onConfigSaved,
 }: {
+  title: string;
+  scopeRow: [string, string];
+  fields: PolicyField[];
+  policy: Record<string, number>;
+  payloadKey: "option_policy" | "crypto_policy";
+  notes: string[];
+  footnote: string;
   snapshot: Snapshot | null;
   tradingEnabled: boolean;
   onConfigSaved: (result: Partial<ConfigResult>) => void;
 }) {
   const confirm = useConfirm();
   const ids = useId();
-  const [draft, setDraft] = useState<Partial<
-    Record<OptionPolicyKey, string>
-  > | null>(null);
+  const [draft, setDraft] = useState<Record<string, string> | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const options = snapshot?.options;
-  if (!options) return null;
-  if (!editablePolicy(options.policy))
-    return (
-      <Card size="sm">
-        <CardContent className="text-muted-foreground">
-          The feed process needs a restart to support editable options limits.
-          Restart when ready; automation will start paused.
-        </CardContent>
-      </Card>
-    );
-
-  const policy = {
-    ...options.policy,
-    ...Object.fromEntries(
-      optionPolicyFields.map(({ key, scale }) => [
-        key,
-        Number(draft?.[key] ?? options.policy[key] * scale) / scale,
-      ]),
-    ),
-  } as OptionPolicy;
+  const policy = Object.fromEntries(
+    fields.map(({ key, scale }) => [
+      key,
+      Number(draft?.[key] ?? saved[key] * scale) / scale,
+    ]),
+  );
   const equity = snapshot?.trading.account.equity;
   const capital =
     equity == null || !snapshot
@@ -425,40 +473,33 @@ function OptionLimits({
       : Math.min(snapshot.settings.capital, equity);
   const ceiling = (pct: number) =>
     money(capital == null ? null : capital * pct);
+  // Ceiling fields are ordered entry <= scoped <= total, matching server validation.
+  const caps = fields.filter((field) => field.hint === "ceiling");
 
   const apply = async () => {
     if (capital === null) return;
     if (
-      policy.max_trade_pct > policy.max_underlying_pct ||
-      policy.max_underlying_pct > policy.max_total_pct
+      caps.some((cap, i) => i > 0 && policy[caps[i - 1].key] > policy[cap.key])
     ) {
       setError(
-        "Entry limit must not exceed the per-ticker limit, which must not exceed the total options limit.",
+        `${caps.map((cap) => cap.label).join(" ≤ ")}: each limit must not exceed the next.`,
       );
       return;
     }
     const ok = await confirm({
-      title: "Apply options risk limits",
+      title: `Apply ${title.toLowerCase()}`,
       rows: [
-        ["Underlyings", options.underlyings.join(", ")],
-        [
-          "Per entry",
-          `${policy.max_trade_pct * 100}% (${ceiling(policy.max_trade_pct)})`,
-        ],
-        [
-          "Per ticker",
-          `${policy.max_underlying_pct * 100}% (${ceiling(policy.max_underlying_pct)})`,
-        ],
-        [
-          "Total options",
-          `${policy.max_total_pct * 100}% (${ceiling(policy.max_total_pct)})`,
-        ],
-        ["Positions / ticker", policy.max_positions_per_underlying],
-        ["Contracts / order", policy.max_contracts],
-        ["Jev confidence", `${policy.min_confidence * 100}%`],
+        scopeRow,
+        ...fields.map(({ key, label, unit, hint }): [string, string] => [
+          label,
+          unit === "%"
+            ? `${Number((policy[key] * 100).toFixed(4))}%${hint === "ceiling" ? ` (${ceiling(policy[key])})` : ""}`
+            : String(policy[key]),
+        ]),
       ],
       notes: [
-        `Automation stays ${tradingEnabled ? "on; new orders may use these limits immediately" : "off"}. Per-ticker exposure includes stock exposure.`,
+        `Automation stays ${tradingEnabled ? "on; new orders may use these limits immediately" : "off"}.`,
+        ...notes,
         "Existing positions, pending orders and exit targets are not changed. Limits are saved on the feed server.",
       ],
       action: "Apply limits",
@@ -470,20 +511,14 @@ function OptionLimits({
       onConfigSaved(
         await postFeed<ConfigResult>(
           "/config",
-          {
-            option_policy: Object.fromEntries(
-              optionPolicyFields.map(({ key }) => [key, policy[key]]),
-            ),
-          },
-          "Options policy update failed",
+          { [payloadKey]: policy },
+          `${title} update failed`,
         ),
       );
       setDraft(null);
-      toast.success(
-        "Options limits saved. New entries use the updated policy; existing exits are unchanged.",
-      );
+      toast.success(`${title} saved. New entries use the updated limits.`);
     } catch (failure) {
-      setError(errorText(failure, "Options policy update failed"));
+      setError(errorText(failure, `${title} update failed`));
     } finally {
       setSaving(false);
     }
@@ -492,7 +527,7 @@ function OptionLimits({
   return (
     <Card size="sm">
       <CardHeader className="border-b">
-        <CardTitle>Options risk limits</CardTitle>
+        <CardTitle>{title}</CardTitle>
         <CardDescription>
           Dollar ceilings use the smaller of applied budget and broker equity:{" "}
           <span className="font-mono text-foreground">{money(capital)}</span>.
@@ -507,72 +542,59 @@ function OptionLimits({
         }}
       >
         <fieldset disabled={saving} className="grid gap-4">
-          <legend className="sr-only">Options entry limits</legend>
-          <CardContent className="grid gap-3 sm:grid-cols-3 lg:grid-cols-6">
-            {optionPolicyFields.map(
-              ({ key, label, unit, scale, min, max, step }) => (
-                <div key={key} className="grid content-start gap-1.5">
-                  <Label htmlFor={`${ids}-${key}`}>{label}</Label>
-                  <InputGroup>
-                    <InputGroupInput
-                      id={`${ids}-${key}`}
-                      name={key}
-                      type="number"
-                      required
-                      min={min}
-                      max={max}
-                      step={step}
-                      value={
-                        draft?.[key] ??
-                        Number((options.policy[key] * scale).toFixed(8))
-                      }
-                      onChange={(event) => {
-                        setDraft((current) => ({
-                          ...current,
-                          [key]: event.target.value,
-                        }));
-                        setError(null);
-                      }}
-                      className="font-mono"
-                    />
-                    {unit && (
-                      <InputGroupAddon align="inline-end">
-                        {unit}
-                      </InputGroupAddon>
-                    )}
-                  </InputGroup>
-                  <span className="text-[0.6875rem] text-muted-foreground">
-                    {key === "max_trade_pct" ||
-                    key === "max_underlying_pct" ||
-                    key === "max_total_pct" ? (
-                      <>
-                        <span className="font-mono">
-                          {ceiling(policy[key])}
-                        </span>{" "}
-                        ceiling
-                      </>
-                    ) : key === "max_positions_per_underlying" ? (
-                      "Held + pending entries"
-                    ) : key === "max_contracts" ? (
-                      "Whole contracts per entry"
-                    ) : (
-                      "Not a profit probability"
-                    )}
-                  </span>
-                </div>
-              ),
+          <legend className="sr-only">{title}</legend>
+          <CardContent
+            className={cn(
+              "grid gap-3 sm:grid-cols-2",
+              fields.length > 4 ? "lg:grid-cols-6" : "lg:grid-cols-4",
             )}
+          >
+            {fields.map(({ key, label, unit, scale, min, max, step, hint }) => (
+              <div key={key} className="grid content-start gap-1.5">
+                <Label htmlFor={`${ids}-${key}`}>{label}</Label>
+                <InputGroup>
+                  <InputGroupInput
+                    id={`${ids}-${key}`}
+                    name={key}
+                    type="number"
+                    required
+                    min={min}
+                    max={max}
+                    step={step}
+                    value={
+                      draft?.[key] ?? Number((saved[key] * scale).toFixed(8))
+                    }
+                    onChange={(event) => {
+                      setDraft((current) => ({
+                        ...current,
+                        [key]: event.target.value,
+                      }));
+                      setError(null);
+                    }}
+                    className="font-mono"
+                  />
+                  {unit && (
+                    <InputGroupAddon align="inline-end">{unit}</InputGroupAddon>
+                  )}
+                </InputGroup>
+                <span className="text-[0.6875rem] text-muted-foreground">
+                  {hint === "ceiling" ? (
+                    <>
+                      <span className="font-mono">{ceiling(policy[key])}</span>{" "}
+                      ceiling
+                    </>
+                  ) : (
+                    hint
+                  )}
+                </span>
+              </div>
+            ))}
             {error && (
               <p role="alert" className="text-down sm:col-span-full">
                 {error}
               </p>
             )}
-            <p className="text-muted-foreground sm:col-span-full">
-              Multiple distinct long calls/puts are allowed; adding to the same
-              contract is not. Confidence gates discretionary options trades,
-              not protective exits. Lower limits block new exposure and never
-              force liquidation.
-            </p>
+            <p className="text-muted-foreground sm:col-span-full">{footnote}</p>
           </CardContent>
           <CardFooter className="gap-2 border-t">
             <Button

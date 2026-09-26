@@ -119,10 +119,6 @@ export default function ScopeEditor({
     } else if (field === "crypto_symbols") {
       change({
         crypto_symbols: remaining,
-        crypto_symbol:
-          scope.crypto_symbol === symbol
-            ? (remaining[0] ?? "")
-            : scope.crypto_symbol,
         crypto_enabled: remaining.length > 0 && scope.crypto_enabled,
       });
     } else {
@@ -137,8 +133,6 @@ export default function ScopeEditor({
       [searchTarget]: [...scope[searchTarget], symbol],
       ...(searchTarget === "stock_symbols" &&
         !scope.stock_symbol && { stock_symbol: symbol }),
-      ...(searchTarget === "crypto_symbols" &&
-        !scope.crypto_symbol && { crypto_symbol: symbol }),
     });
 
   const save = async () => {
@@ -154,14 +148,8 @@ export default function ScopeEditor({
       return setError(
         "Add an options underlying or turn options automation off.",
       );
-    if (
-      scope.crypto_enabled &&
-      (!scope.crypto_symbol ||
-        !scope.crypto_symbols.includes(scope.crypto_symbol))
-    )
-      return setError(
-        "Choose a crypto strategy pair or turn crypto automation off.",
-      );
+    if (scope.crypto_enabled && !scope.crypto_symbols.length)
+      return setError("Add a crypto pair or turn crypto automation off.");
     const ok = await confirm({
       title: "Save paper trading scope",
       rows: [
@@ -175,7 +163,9 @@ export default function ScopeEditor({
         ["Crypto watchlist", scope.crypto_symbols.join(", ") || "Empty"],
         [
           "Crypto automation",
-          scope.crypto_enabled ? `On, ${scope.crypto_symbol}` : "Off",
+          scope.crypto_enabled
+            ? `On, all ${scope.crypto_symbols.length} pairs`
+            : "Off",
         ],
         [
           "Master automation",
@@ -257,15 +247,12 @@ export default function ScopeEditor({
           ) : (
             <ScopeList
               title="Crypto automation"
-              description="Trades one pair 24/7, no margin or short selling. The watchlist also permits manual entries."
+              description="Evaluates every pair below 24/7 (spot only: no margin or short selling). The watchlist also permits manual entries."
               enabled={scope.crypto_enabled}
               onEnabled={(crypto_enabled) => change({ crypto_enabled })}
               symbols={scope.crypto_symbols}
               onRemove={(symbol) => remove("crypto_symbols", symbol)}
               empty="No crypto pairs selected."
-              strategy={scope.crypto_symbol}
-              onStrategy={(crypto_symbol) => change({ crypto_symbol })}
-              strategyLabel="Strategy pair"
             />
           )}
 

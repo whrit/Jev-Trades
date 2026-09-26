@@ -202,9 +202,7 @@ class CryptoExecution(unittest.TestCase):
 
     def _trader(self, *, crypto_status=AccountStatus.ACTIVE, buying_power=100000.0):
         trader = PaperTrader()
-        trader.scope = config.TradingScope(
-            crypto_symbols=(BTC,), crypto_symbol=BTC, crypto_enabled=True
-        )
+        trader.scope = config.TradingScope(crypto_symbols=(BTC,), crypto_enabled=True)
         broker, quotes = CryptoBroker(), CryptoQuotes()
         broker.crypto_status = crypto_status
         broker.non_marginable_buying_power = buying_power
@@ -223,7 +221,6 @@ class CryptoExecution(unittest.TestCase):
             trader.configure(
                 trading_scope={
                     "crypto_symbols": [" btc/usd "],
-                    "crypto_symbol": "btc/usd",
                     "crypto_enabled": True,
                 }
             )
@@ -411,9 +408,7 @@ class CryptoExecution(unittest.TestCase):
         trader.refresh()
         self.assertAlmostEqual(trader.exits[BTC]["stop_loss_price"], 57000)
         # Pause automation and drop BTC/USD from the crypto watchlist entirely.
-        trader.configure(
-            trading_scope={"crypto_enabled": False, "crypto_symbols": (), "crypto_symbol": ""}
-        )
+        trader.configure(trading_scope={"crypto_enabled": False, "crypto_symbols": ()})
         self.assertFalse(trader.scope.crypto_enabled)
         self.assertNotIn(BTC, trader.scope.crypto_symbols)
         quotes.bid, quotes.ask = 56000.0, 56002.0
@@ -467,7 +462,7 @@ class CryptoExecution(unittest.TestCase):
         trader, broker, quotes = self._trader()
         trader.api_key = "offline-test"
         trader.configure(enabled=True)
-        # Wrong symbol / disabled scope silently drop the submission (no crash, no queue).
+        # A pair outside the watchlist / disabled scope silently drops the submission.
         trader.submit({"symbol": "ETH/USD", "current_price": 3000}, strategy="crypto")
         self.assertTrue(trader.pending.empty())
         trader.configure(trading_scope={"crypto_enabled": False})
@@ -503,6 +498,53 @@ class CryptoExecution(unittest.TestCase):
         self.assertEqual((event["strategy"], event["executed"]), ("crypto", "submitted"))
         self.assertEqual(broker.requests[-1].symbol, BTC)
         self.assertIsNone(getattr(broker.requests[-1], "position_intent", None))
+
+    def test_multi_pair_scope_crypto_limits_and_independent_risk_profile(self):
+        trader, broker, quotes = self._trader()
+        trader.api_key = "offline-test"
+        trader.instruments["ETH/USD"] = dict(INSTRUMENT)
+        # Offline broker only lists BTC, so seed the two-pair watchlist directly.
+        trader.scope = config.TradingScope(crypto_symbols=(BTC, "ETH/USD"), crypto_enabled=True)
+        trader.configure(
+            enabled=True,
+            crypto_policy={
+                "max_trade_pct": 0.05,
+                "max_pair_pct": 0.08,
+                "max_total_pct": 0.1,
+                "min_confidence": 0.8,
+            },
+            risk_appetite="aggressive",
+        )
+        for pair in (BTC, "ETH/USD"):  # every watchlist pair is automated, not one
+            trader.submit({"symbol": pair, "current_price": 1}, strategy="crypto")
+        self.assertEqual(trader.pending.qsize(), 2)
+        capital = min(trader.starting_cash, trader.account["equity"])
+        self.assertAlmostEqual(trader._crypto_capacity(BTC), capital * 0.05)
+        with self.assertRaises(ValueError):  # entry <= pair <= total
+            trader.configure(crypto_policy={"max_trade_pct": 0.2})
+        state = {
+            "symbol": BTC,
+            "current_price": 60000,
+            "strategy": "crypto",
+            "time_frame": "1m",
+            "quote_time": time.time(),
+            "bar_time": time.time() - 60,
+        }
+        response = {"answers": {"action_choice": {"choice": "buy", "confidence": 0.7}}}
+        # The stock profile is aggressive (50% gate), but crypto uses its own 80% minimum.
+        event = trader._apply_decision(state, response)
+        self.assertEqual(event["executed"], "hold")
+        self.assertIn("80%", event["reason"])
+        self.assertEqual(broker.requests, [])
+
+    def test_legacy_single_pair_scope_migrates_disabled(self):
+        db.init_db()
+        db.save_configuration(
+            None, {"crypto_symbols": [BTC], "crypto_symbol": BTC, "crypto_enabled": True}
+        )
+        trader = PaperTrader()
+        self.assertEqual(trader.scope.crypto_symbols, (BTC,))
+        self.assertFalse(trader.scope.crypto_enabled)
 
     def test_legacy_no_slash_symbols_normalize_to_canonical_and_migrate_exit_targets(self):
         trader, broker, _ = self._trader()

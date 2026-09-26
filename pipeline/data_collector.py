@@ -29,6 +29,7 @@ from alpaca.data.models import BarSet
 from alpaca.data.requests import (
     CryptoBarsRequest,
     CryptoLatestQuoteRequest,
+    CryptoSnapshotRequest,
     OptionBarsRequest,
     OptionLatestQuoteRequest,
     StockBarsRequest,
@@ -74,6 +75,7 @@ class MarketState:
         self.capital = 100_000.0
         self.max_wallet_position_pct = 0.75
         self.risk_appetite = "balanced"
+        self.crypto_risk_appetite = "balanced"
         self.active_timeframes = ["1m"]
         self.crypto_stream_error: str | None = None
         self.stock_stream_error: str | None = None
@@ -123,6 +125,17 @@ class MarketState:
                     "policy": TRADER.option_policy.model_dump(),
                     "feed": config.OPTION_FEED.value,
                 },
+                "crypto": {
+                    "policy": TRADER.crypto_policy.model_dump(),
+                    # Per-pair watchlist detail; day stats use Alpaca's UTC daily bars.
+                    "quotes": {
+                        s: {
+                            key: self.markets.get(s, {}).get(key)
+                            for key in ("bid", "ask", "price", "status", "prev_close")
+                        }
+                        for s in TRADER.scope.crypto_symbols
+                    },
+                },
                 "data_feeds": {
                     "stocks": config.STOCK_FEED.value,
                     "options": config.OPTION_FEED.value,
@@ -144,6 +157,7 @@ class MarketState:
                     "capital": self.capital,
                     "max_wallet_position_pct": self.max_wallet_position_pct,
                     "risk_appetite": self.risk_appetite,
+                    "crypto_risk_appetite": self.crypto_risk_appetite,
                     "active_timeframes": self.active_timeframes,
                     "chart_timeframe": tf,
                 },
@@ -476,7 +490,9 @@ def build_agent_state(symbol: str, timeframe: str = "1m") -> dict[str, Any]:
             "take_profit_pct": position.get("take_profit_pct"),
             "position_age_bars": 0,
             "max_wallet_position_pct": STATE.max_wallet_position_pct,
-            "risk_appetite": STATE.risk_appetite,
+            "risk_appetite": STATE.crypto_risk_appetite
+            if TRADER.is_crypto(symbol)
+            else STATE.risk_appetite,
             "price": {
                 "change_percent": ((price - day_open) / day_open) * 100 if day_open else 0,
                 "day_high": day_high,
@@ -506,6 +522,8 @@ def update_quote(symbol: str, quote: Any) -> None:
         if market["last_tick"] is not None and timestamp < market["last_tick"]:
             return
         market.update(
+            bid=bid,
+            ask=ask,
             price=(bid + ask) / 2,
             last_tick=timestamp,
             status="live" if fresh else "stale quote",
@@ -772,6 +790,17 @@ def market_worker() -> None:
                     else:
                         raise ValueError("Market data client is unavailable")
                     merge_bars(symbol, cast(BarSet, bars).data.get(symbol, []))
+                    if is_crypto:
+                        result = crypto.get_crypto_snapshot(
+                            CryptoSnapshotRequest(symbol_or_symbols=symbol),
+                            feed=config.CRYPTO_FEED,
+                        )
+                        daily = cast(dict[str, Any], result)[symbol]
+                        previous = daily.previous_daily_bar
+                        with STATE.lock:
+                            STATE.markets[symbol]["prev_close"] = (
+                                previous.close if previous else None
+                            )
                     last_history[symbol] = time.time()
             except Exception as error:
                 with STATE.lock:
@@ -787,6 +816,7 @@ def configure(payload: dict[str, Any]) -> None:
         capital = request.get("capital", STATE.capital)
         pct = request.get("max_wallet_position_pct", STATE.max_wallet_position_pct)
         risk = request.get("risk_appetite", STATE.risk_appetite)
+        crypto_risk = request.get("crypto_risk_appetite", STATE.crypto_risk_appetite)
         key = request.get("typesafe_api_key")
 
         if any(tf not in TIMEFRAMES for tf in frames):
@@ -798,10 +828,13 @@ def configure(payload: dict[str, Any]) -> None:
             key,
             option_policy=request.get("option_policy"),
             trading_scope=request.get("trading_scope"),
+            crypto_policy=request.get("crypto_policy"),
+            crypto_risk_appetite=crypto_risk,
             enabled=enabled,
         )
         STATE.trading_enabled = enabled
-        STATE.capital, STATE.max_wallet_position_pct, STATE.risk_appetite = capital, pct, risk
+        STATE.capital, STATE.max_wallet_position_pct = capital, pct
+        STATE.risk_appetite, STATE.crypto_risk_appetite = risk, crypto_risk
         STATE.active_timeframes = list(dict.fromkeys(frames))
 
 
@@ -923,6 +956,7 @@ class FeedHandler(BaseHTTPRequestHandler):
                         "ok": True,
                         "settings": STATE.snapshot()["settings"],
                         "option_policy": TRADER.option_policy.model_dump(),
+                        "crypto_policy": TRADER.crypto_policy.model_dump(),
                         "trading_scope": TRADER.scope.model_dump(mode="json"),
                         "trading_enabled": TRADER.enabled,
                     }

@@ -97,6 +97,20 @@ export type OptionScan = {
   eligible?: number;
   candidates?: OptionCandidate[];
 };
+export type CryptoPolicy = {
+  max_trade_pct: number;
+  max_pair_pct: number;
+  max_total_pct: number;
+  min_confidence: number;
+};
+export type CryptoQuote = {
+  bid: number | null;
+  ask: number | null;
+  price: number | null;
+  status: string | null;
+  /** Previous UTC daily close, for the day change. */
+  prev_close: number | null;
+};
 export type OptionPolicy = {
   min_dte: number;
   max_dte: number;
@@ -127,7 +141,6 @@ export type TradingScope = {
   stock_enabled: boolean;
   options_enabled: boolean;
   crypto_symbols: string[];
-  crypto_symbol: string;
   crypto_enabled: boolean;
 };
 export type Instrument = {
@@ -144,6 +157,7 @@ export type Settings = {
   capital: number;
   max_wallet_position_pct: number;
   risk_appetite: string;
+  crypto_risk_appetite: string;
   active_timeframes: string[];
   chart_timeframe: string;
 };
@@ -173,6 +187,8 @@ export type Snapshot = {
       available_cash: number | null;
       equity: number | null;
       options_exposure?: number | null;
+      /** Held crypto value plus fee-inclusive pending crypto buys. */
+      crypto_exposure?: number | null;
       crypto_status?: string | null;
       crypto_buying_power?: number | null;
       options_buying_power?: number;
@@ -194,6 +210,7 @@ export type Snapshot = {
   };
   settings: Settings;
   options?: { underlyings: string[]; policy: OptionPolicy; feed: string };
+  crypto?: { policy: CryptoPolicy; quotes: Record<string, CryptoQuote> };
 };
 export type AssetMode = "equities" | "crypto";
 /** Response of POST /config; the fields present depend on the patch sent. */
@@ -202,7 +219,11 @@ export type ConfigResult = {
   trading_enabled: boolean;
   trading_scope: TradingScope;
   option_policy: OptionPolicy;
+  crypto_policy: CryptoPolicy;
 };
+
+/** Mirrors pipeline/paper_trader.py: worst-tier Alpaca crypto taker fee used for sizing. */
+export const CRYPTO_TAKER_FEE = 0.0025;
 
 // Mirrors the CSS tokens in app/globals.css (the chart canvas cannot read them).
 export const chartColors = {
@@ -365,42 +386,49 @@ export const indicatorLabel = (key: string) =>
     .flatMap((group) => group.items)
     .find(([k]) => k === key)?.[1] ?? key;
 
-export const optionPolicyFields = [
-  {
-    key: "max_trade_pct",
-    label: "Per-entry premium",
-    unit: "%",
-    scale: 100,
-    min: 0.01,
-    max: 100,
-    step: 0.01,
-  },
-  {
-    key: "max_underlying_pct",
-    label: "Per-ticker exposure",
-    unit: "%",
-    scale: 100,
-    min: 0.01,
-    max: 100,
-    step: 0.01,
-  },
-  {
-    key: "max_total_pct",
-    label: "Total options exposure",
-    unit: "%",
-    scale: 100,
-    min: 0.01,
-    max: 100,
-    step: 0.01,
-  },
+/** One editable risk-limit input. `ceiling` fields show their dollar ceiling. */
+export type PolicyField = {
+  key: string;
+  label: string;
+  unit: "%" | "";
+  scale: number;
+  min: number;
+  max?: number;
+  step: number;
+  hint: string | "ceiling";
+};
+const pctField = (key: string, label: string): PolicyField => ({
+  key,
+  label,
+  unit: "%",
+  scale: 100,
+  min: 0.01,
+  max: 100,
+  step: 0.01,
+  hint: "ceiling",
+});
+const confidenceField: PolicyField = {
+  key: "min_confidence",
+  label: "Jev confidence",
+  unit: "%",
+  scale: 100,
+  min: 0,
+  max: 100,
+  step: 0.01,
+  hint: "Not a profit probability",
+};
+export const optionPolicyFields: PolicyField[] = [
+  pctField("max_trade_pct", "Per-entry premium"),
+  pctField("max_underlying_pct", "Per-ticker exposure"),
+  pctField("max_total_pct", "Total options exposure"),
   {
     key: "max_positions_per_underlying",
     label: "Positions per ticker",
     unit: "",
     scale: 1,
     min: 1,
-    max: undefined,
     step: 1,
+    hint: "Held + pending entries",
   },
   {
     key: "max_contracts",
@@ -408,17 +436,14 @@ export const optionPolicyFields = [
     unit: "",
     scale: 1,
     min: 1,
-    max: undefined,
     step: 1,
+    hint: "Whole contracts per entry",
   },
-  {
-    key: "min_confidence",
-    label: "Jev confidence",
-    unit: "%",
-    scale: 100,
-    min: 0,
-    max: 100,
-    step: 0.01,
-  },
-] as const;
-export type OptionPolicyKey = (typeof optionPolicyFields)[number]["key"];
+  confidenceField,
+];
+export const cryptoPolicyFields: PolicyField[] = [
+  pctField("max_trade_pct", "Per-entry notional"),
+  pctField("max_pair_pct", "Per-pair exposure"),
+  pctField("max_total_pct", "Total crypto exposure"),
+  confidenceField,
+];

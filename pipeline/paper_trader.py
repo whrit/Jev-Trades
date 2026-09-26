@@ -122,11 +122,13 @@ class PaperTrader:
         capital: float = 100_000,
         max_wallet_position_pct: float = 0.75,
         risk_appetite: str = "balanced",
+        crypto_risk_appetite: str = "balanced",
     ) -> None:
         self.lock = threading.RLock()
         self.starting_cash = positive(capital, "Strategy budget")
         self.max_wallet_position_pct = max_wallet_position_pct
         self.risk_appetite = risk_appetite
+        self.crypto_risk_appetite = crypto_risk_appetite
         self.api_key = os.getenv("TYPESAFE_API_KEY") or os.getenv("TYPESAFE_AI_API_KEY", "")
         self.enabled = False
         self.asset_directory: list[dict[str, str]] | None = None
@@ -153,7 +155,15 @@ class PaperTrader:
         self.option_policy = config.OptionPolicy.model_validate(
             {**config.OPTIONS.model_dump(), **db.get_option_policy()}, strict=True
         )
-        self.scope = config.TradingScope.model_validate(db.get_trading_scope())
+        self.crypto_policy = config.CryptoPolicy.model_validate(
+            {**config.CRYPTO.model_dump(), **db.get_crypto_policy()}, strict=True
+        )
+        saved_scope = db.get_trading_scope()
+        if saved_scope.pop("crypto_symbol", None) is not None:
+            # Legacy single-pair crypto strategy. Multi-pair automation covers the whole
+            # watchlist, so require an explicit re-enable instead of silently widening it.
+            saved_scope["crypto_enabled"] = False
+        self.scope = config.TradingScope.model_validate(saved_scope)
         self.pending.maxsize = max(
             5,
             len(
@@ -333,7 +343,7 @@ class PaperTrader:
             viewed = [
                 s for s, requested in self.chart_requests.items() if time.time() - requested <= 30
             ]
-            selected = [s for s in (self.scope.stock_symbol, self.scope.crypto_symbol) if s]
+            selected = [self.scope.stock_symbol] if self.scope.stock_symbol else []
             return tuple(
                 dict.fromkeys(
                     [
@@ -545,11 +555,16 @@ class PaperTrader:
         api_key=None,
         option_policy: Mapping[str, Any] | None = None,
         trading_scope: Mapping[str, Any] | None = None,
+        crypto_policy: Mapping[str, Any] | None = None,
+        crypto_risk_appetite=None,
         enabled: bool | None = None,
     ) -> None:
         with self.lock:
             policy = config.OptionPolicy.model_validate(
                 {**self.option_policy.model_dump(), **(option_policy or {})}, strict=True
+            )
+            crypto_limits = config.CryptoPolicy.model_validate(
+                {**self.crypto_policy.model_dump(), **(crypto_policy or {})}, strict=True
             )
             scope = config.TradingScope.model_validate(
                 {**self.scope.model_dump(), **(trading_scope or {})}
@@ -580,20 +595,27 @@ class PaperTrader:
             if pct > 1:
                 raise ValueError("Max position fraction cannot exceed 1")
             risk = self.risk_appetite if risk_appetite is None else risk_appetite
-            if risk not in {"conservative", "balanced", "aggressive"}:
+            crypto_risk = (
+                self.crypto_risk_appetite if crypto_risk_appetite is None else crypto_risk_appetite
+            )
+            if {risk, crypto_risk} - {"conservative", "balanced", "aggressive"}:
                 raise ValueError("Invalid risk appetite")
             key = api_key.strip() if api_key else self.api_key
             if enabled:
                 self._ready()
                 if not key:
                     raise ValueError("Set a TypeSafe API key before enabling automation")
-            if option_policy is not None or trading_scope is not None:
+            if option_policy is not None or trading_scope is not None or crypto_policy is not None:
                 db.save_configuration(
                     {**db.get_option_policy(), **option_policy}
                     if option_policy is not None
                     else None,
                     scope.model_dump(mode="json") if trading_scope is not None else None,
+                    {**db.get_crypto_policy(), **crypto_policy}
+                    if crypto_policy is not None
+                    else None,
                 )
+                self.crypto_policy = crypto_limits
                 self.option_policy, self.scope = policy, scope
                 self.pending.maxsize = max(
                     5,
@@ -609,11 +631,8 @@ class PaperTrader:
                     }
                     for s in scope.option_underlyings
                 }
-            self.starting_cash, self.max_wallet_position_pct, self.risk_appetite = (
-                capital,
-                pct,
-                risk,
-            )
+            self.starting_cash, self.max_wallet_position_pct = capital, pct
+            self.risk_appetite, self.crypto_risk_appetite = risk, crypto_risk
             self.api_key = key
             if enabled is not None:
                 self.enabled = enabled
@@ -659,6 +678,8 @@ class PaperTrader:
                         "positions": self.positions,
                         "max_wallet_position_pct": self.max_wallet_position_pct,
                         "risk_appetite": self.risk_appetite,
+                        "crypto_risk_appetite": self.crypto_risk_appetite,
+                        "crypto_exposure": self._crypto_exposure()[1] if self.account else None,
                         "paper_trading": True,
                         "options_exposure": (
                             sum(
@@ -855,6 +876,43 @@ class PaperTrader:
                 capital * self.option_policy.max_trade_pct,
                 capital * self.option_policy.max_underlying_pct - underlying_exposure,
                 capital * self.option_policy.max_total_pct - option_exposure,
+            ),
+        )
+
+    def _crypto_exposure(self, symbol: str | None = None) -> tuple[float, float]:
+        """(symbol, all-crypto) exposure: held market value plus fee-inclusive pending buys."""
+        pair = total = 0.0
+        for ticker, position in self.positions.items():
+            if self.is_crypto(ticker):
+                value = max(0, position["market_value"])
+                total += value
+                pair += value if ticker == symbol else 0
+        for order in self.orders.values():
+            if (
+                order["side"] != "buy"
+                or order["status"] in TERMINAL
+                or not self.is_crypto(order["symbol"])
+            ):
+                continue
+            reserved = (
+                max(0, order["quantity"] - order["filled_qty"])
+                * (order.get("estimated_price") or 0)
+                * (1 + CRYPTO_TAKER_FEE)
+            )
+            total += reserved
+            pair += reserved if order["symbol"] == symbol else 0
+        return pair, total
+
+    def _crypto_capacity(self, symbol: str) -> float:
+        capital = min(self.starting_cash, self.account["equity"])
+        policy = self.crypto_policy
+        pair, total = self._crypto_exposure(symbol)
+        return max(
+            0.0,
+            min(
+                capital * policy.max_trade_pct,
+                capital * policy.max_pair_pct - pair,
+                capital * policy.max_total_pct - total,
             ),
         )
 
@@ -1465,11 +1523,7 @@ class PaperTrader:
                 if not self.scope.options_enabled or symbol not in self.scope.option_underlyings:
                     return
             elif strategy == "crypto":
-                if (
-                    not self.scope.crypto_enabled
-                    or symbol != self.scope.crypto_symbol
-                    or symbol not in self.scope.crypto_symbols
-                ):
+                if not self.scope.crypto_enabled or symbol not in self.scope.crypto_symbols:
                     return
             elif (
                 strategy != "stock"
@@ -1585,7 +1639,13 @@ class PaperTrader:
         answers = response.get("answers", {})
         answer = answers.get("action_choice", {})
         action, confidence = answer.get("choice", "hold"), float(answer.get("confidence", 0))
-        threshold = {"conservative": 0.75, "balanced": 0.6, "aggressive": 0.5}[self.risk_appetite]
+        crypto = state.get("strategy") == "crypto"
+        profile = self.crypto_risk_appetite if crypto else self.risk_appetite
+        threshold = (
+            self.crypto_policy.min_confidence
+            if crypto
+            else {"conservative": 0.75, "balanced": 0.6, "aggressive": 0.5}[profile]
+        )
         event = {
             "timestamp": time.time(),
             "symbol": state["symbol"],
@@ -1619,11 +1679,11 @@ class PaperTrader:
             raise ValueError("Invalid agent size")
         fraction = 0.25 if score < 0.67 else 0.5 if score < 1.34 else 1.0
         if action == "buy":
-            risk = {"conservative": 0.5, "balanced": 0.75, "aggressive": 1.0}[self.risk_appetite]
+            risk = {"conservative": 0.5, "balanced": 0.75, "aggressive": 1.0}[profile]
             sl_choice = answers.get("stop_loss_target", {}).get("choice", "moderate")
             tp_choice = answers.get("take_profit_target", {}).get("choice", "balanced")
-            sl_mult = {"conservative": 0.8, "balanced": 1.0, "aggressive": 1.3}[self.risk_appetite]
-            tp_mult = {"conservative": 0.9, "balanced": 1.0, "aggressive": 1.2}[self.risk_appetite]
+            sl_mult = {"conservative": 0.8, "balanced": 1.0, "aggressive": 1.3}[profile]
+            tp_mult = {"conservative": 0.9, "balanced": 1.0, "aggressive": 1.2}[profile]
             atr = state.get("price", {}).get("atr14")
             if atr is not None and math.isfinite(float(atr)) and atr > 0:
                 sl = (
@@ -1647,6 +1707,8 @@ class PaperTrader:
                     tp_choice, 6.0
                 ) * tp_mult
             allocation = self._buying_capacity(symbol) * risk * fraction
+            if crypto:
+                allocation = min(allocation, self._crypto_capacity(symbol))
             if allocation <= 0:
                 return event
             order = self.manual_buy(

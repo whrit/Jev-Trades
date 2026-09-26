@@ -117,6 +117,10 @@ export default function Home() {
           ...(scope && { underlyings: scope.option_underlyings }),
           ...(result.option_policy && { policy: result.option_policy }),
         },
+        crypto: current.crypto && {
+          ...current.crypto,
+          ...(result.crypto_policy && { policy: result.crypto_policy }),
+        },
       };
     });
     if (result.trading_enabled !== undefined)
@@ -146,7 +150,10 @@ export default function Home() {
                   : "Off",
               ],
               ["Stock", scope?.stock_enabled ? scope.stock_symbol : "Off"],
-              ["Crypto", scope?.crypto_enabled ? scope.crypto_symbol : "Off"],
+              [
+                "Crypto",
+                scope?.crypto_enabled ? scope.crypto_symbols.join(", ") : "Off",
+              ],
               ["Applied budget", money(snapshot.settings.capital)],
               ["Evaluation", snapshot.settings.active_timeframes.join(", ")],
             ],

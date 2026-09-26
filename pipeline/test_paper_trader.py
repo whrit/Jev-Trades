@@ -46,6 +46,8 @@ class Broker:
             options_trading_level=2,
             trading_blocked=False,
             account_blocked=False,
+            crypto_status=None,
+            non_marginable_buying_power="0",
         )
 
     def get_orders(self, request):

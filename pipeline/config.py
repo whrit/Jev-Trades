@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from typing import Self
 
-from alpaca.data.enums import DataFeed, OptionsFeed
+from alpaca.data.enums import CryptoFeed, DataFeed, OptionsFeed
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -23,11 +23,13 @@ def symbols(name: str, default: str, pattern: str) -> tuple[str, ...]:
 
 STOCK_SYMBOLS = symbols("ALPACA_STOCK_SYMBOLS", "SPY,AAPL,MSFT", r"[A-Z][A-Z0-9.]{0,9}")
 OPTION_UNDERLYINGS = symbols("ALPACA_OPTION_UNDERLYINGS", "", r"[A-Z][A-Z0-9.]{0,9}")
-MARKET_SYMBOLS = tuple(dict.fromkeys(STOCK_SYMBOLS + OPTION_UNDERLYINGS))
+CRYPTO_SYMBOLS = symbols("ALPACA_CRYPTO_SYMBOLS", "", r"[A-Z][A-Z0-9]{0,19}/USD")
+MARKET_SYMBOLS = tuple(dict.fromkeys(STOCK_SYMBOLS + OPTION_UNDERLYINGS + CRYPTO_SYMBOLS))
 if os.getenv("ALPACA_OPTION_SYMBOLS", "").strip():
     raise ValueError("Replace ALPACA_OPTION_SYMBOLS with ALPACA_OPTION_UNDERLYINGS (stock tickers)")
 STOCK_FEED = DataFeed(os.getenv("ALPACA_STOCK_FEED", "iex"))
 OPTION_FEED = OptionsFeed(os.getenv("ALPACA_OPTION_FEED", "indicative"))
+CRYPTO_FEED = CryptoFeed.US
 if STOCK_FEED not in (DataFeed.IEX, DataFeed.SIP):
     raise ValueError("ALPACA_STOCK_FEED must be iex or sip")
 ALLOWED_ORIGINS = set(
@@ -43,6 +45,9 @@ class TradingScope(BaseModel):
     stock_symbol: str = Field(default_factory=lambda: next(iter(STOCK_SYMBOLS), ""))
     stock_enabled: bool = Field(default_factory=lambda: bool(STOCK_SYMBOLS))
     options_enabled: bool = Field(default_factory=lambda: bool(OPTION_UNDERLYINGS))
+    crypto_symbols: tuple[str, ...] = Field(default_factory=lambda: CRYPTO_SYMBOLS)
+    crypto_symbol: str = Field(default_factory=lambda: next(iter(CRYPTO_SYMBOLS), ""))
+    crypto_enabled: bool = False
 
     @field_validator("stock_symbols", "option_underlyings", mode="before")
     @classmethod
@@ -54,7 +59,17 @@ class TradingScope(BaseModel):
             raise ValueError("Use stock/ETF tickers, not option contract symbols")
         return normalized
 
-    @field_validator("stock_symbol")
+    @field_validator("crypto_symbols", mode="before")
+    @classmethod
+    def valid_crypto_symbols(cls, values):
+        if not isinstance(values, (list, tuple)) or any(not isinstance(s, str) for s in values):
+            raise ValueError("Crypto watchlists must contain BASE/USD pair strings")
+        normalized = tuple(dict.fromkeys(s.strip().upper() for s in values))
+        if any(not re.fullmatch(r"[A-Z][A-Z0-9]{0,19}/USD", s) for s in normalized):
+            raise ValueError("Use USD-quoted crypto pairs such as BTC/USD")
+        return normalized
+
+    @field_validator("stock_symbol", "crypto_symbol")
     @classmethod
     def normalize_stock(cls, value: str) -> str:
         return value.strip().upper()
@@ -67,6 +82,10 @@ class TradingScope(BaseModel):
             raise ValueError("Select a stock strategy symbol or turn stock automation off")
         if self.options_enabled and not self.option_underlyings:
             raise ValueError("Add option underlyings or turn options automation off")
+        if self.crypto_symbol and self.crypto_symbol not in self.crypto_symbols:
+            raise ValueError("Crypto strategy symbol must belong to the crypto watchlist")
+        if self.crypto_enabled and not self.crypto_symbol:
+            raise ValueError("Select a crypto strategy symbol or turn crypto automation off")
         return self
 
 

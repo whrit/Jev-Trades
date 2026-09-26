@@ -6,6 +6,7 @@ import json
 import math
 import os
 import queue
+import re
 import threading
 import time
 import urllib.request
@@ -18,8 +19,16 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from alpaca.common.exceptions import APIError
-from alpaca.data.historical import OptionHistoricalDataClient, StockHistoricalDataClient
-from alpaca.data.requests import OptionLatestQuoteRequest, StockLatestQuoteRequest
+from alpaca.data.historical import (
+    CryptoHistoricalDataClient,
+    OptionHistoricalDataClient,
+    StockHistoricalDataClient,
+)
+from alpaca.data.requests import (
+    CryptoLatestQuoteRequest,
+    OptionLatestQuoteRequest,
+    StockLatestQuoteRequest,
+)
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import (
     AssetClass,
@@ -44,6 +53,7 @@ from alpaca.trading.requests import (
     GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
+    StopLimitOrderRequest,
 )
 
 if __package__:
@@ -57,6 +67,12 @@ else:
 
 TERMINAL = {"filled", "canceled", "expired", "rejected", "replaced"}
 TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone"
+CRYPTO_TAKER_FEE = 0.0025  # Conservative: Alpaca's worst-case (lowest 30d-volume tier) taker fee.
+CRYPTO_PAIR = re.compile(r"[A-Z][A-Z0-9]{0,19}/USD")  # Matches config.TradingScope's own shape.
+
+
+def is_crypto_pair(symbol: str) -> bool:
+    return bool(CRYPTO_PAIR.fullmatch(symbol))
 
 
 def positive(value: Any, name: str) -> float:
@@ -76,6 +92,30 @@ def rounded_quantity(value: float, option: bool) -> float:
     )
 
 
+def crypto_quantity(value: float, instrument: Mapping[str, Any], *, floor: bool) -> float:
+    """Enforce broker min order size and trade increment. Auto-derived sizes floor down;
+    explicit caller-supplied quantities are rejected outright rather than silently adjusted.
+    """
+    step = Decimal(str(instrument["min_trade_increment"]))
+    minimum = Decimal(str(instrument["min_order_size"]))
+    quantized = Decimal(str(value))
+    if floor:
+        quantized = (quantized / step).to_integral_value(rounding=ROUND_DOWN) * step
+    if quantized < minimum or quantized % step != 0:
+        raise ValueError(
+            "Crypto quantity must meet the broker minimum order size and trade increment"
+        )
+    return float(quantized)
+
+
+def crypto_price(value: float, instrument: Mapping[str, Any]) -> float:
+    """Broker-quoted crypto prices must land on the instrument's price increment grid."""
+    step = Decimal(str(instrument["price_increment"]))
+    if Decimal(str(value)) % step != 0:
+        raise ValueError("Crypto price must be a multiple of the broker price increment")
+    return value
+
+
 class PaperTrader:
     def __init__(
         self,
@@ -90,12 +130,14 @@ class PaperTrader:
         self.api_key = os.getenv("TYPESAFE_API_KEY") or os.getenv("TYPESAFE_AI_API_KEY", "")
         self.enabled = False
         self.asset_directory: list[dict[str, str]] | None = None
+        self.crypto_asset_directory: list[dict[str, str]] | None = None
         self.generation = 0
         self.pending: queue.Queue = queue.Queue()
         self.queued: set[tuple[str, str, str]] = set()
         self.client = None
         self.stock_data = None
         self.option_data = None
+        self.crypto_data = None
         self.instruments: dict[str, dict[str, Any]] = {}
         self.positions: dict[str, dict[str, Any]] = {}
         self.account: dict[str, Any] = {}
@@ -113,7 +155,15 @@ class PaperTrader:
         )
         self.scope = config.TradingScope.model_validate(db.get_trading_scope())
         self.pending.maxsize = max(
-            5, len(set(self.scope.stock_symbols + self.scope.option_underlyings)) * 10
+            5,
+            len(
+                set(
+                    self.scope.stock_symbols
+                    + self.scope.option_underlyings
+                    + self.scope.crypto_symbols
+                )
+            )
+            * 10,
         )
         self.option_scans = {s: {"status": "idle"} for s in self.scope.option_underlyings}
         self.orders = {o["client_order_id"]: o for o in db.get_orders()}
@@ -141,9 +191,13 @@ class PaperTrader:
         self.client = TradingClient(key, secret, paper=True)
         self.stock_data = StockHistoricalDataClient(key, secret)
         self.option_data = OptionHistoricalDataClient(key, secret)
+        self.crypto_data = CryptoHistoricalDataClient(key, secret)
         self.asset_directory = None
+        self.crypto_asset_directory = None
         for symbol in (*self.scope.stock_symbols, *self.scope.option_underlyings):
             self.instruments[symbol] = self._stock_metadata(symbol)
+        for symbol in self.scope.crypto_symbols:
+            self.instruments[symbol] = self._crypto_metadata(symbol)
 
     def _stock_metadata(self, symbol: str) -> dict[str, Any]:
         if self.client is None:
@@ -159,34 +213,92 @@ class PaperTrader:
             "expiration": None,
         }
 
-    def search_assets(self, query: str) -> list[dict[str, str]]:
+    def _crypto_metadata(self, symbol: str) -> dict[str, Any]:
+        if self.client is None:
+            raise ValueError("Alpaca paper client is unavailable")
+        asset = cast(Asset, self.client.get_asset(symbol))
+        if (
+            asset.symbol != symbol
+            or asset.asset_class != AssetClass.CRYPTO
+            or not is_crypto_pair(asset.symbol)
+        ):
+            raise ValueError("Expected a matching USD-quoted crypto asset")
+        if (
+            asset.min_order_size is None
+            or asset.min_trade_increment is None
+            or asset.price_increment is None
+        ):
+            raise ValueError("Crypto instrument is missing broker sizing metadata")
+        return {
+            "asset_class": "crypto",
+            "multiplier": 1,
+            "tradable": asset.tradable and asset.status == AssetStatus.ACTIVE,
+            "fractionable": asset.fractionable,
+            "expiration": None,
+            "min_order_size": positive(asset.min_order_size, "Minimum order size"),
+            "min_trade_increment": positive(asset.min_trade_increment, "Minimum trade increment"),
+            "price_increment": positive(asset.price_increment, "Price increment"),
+        }
+
+    def _canonical_crypto_symbol(self, symbol: str, asset_id: Any) -> str:
+        """Alpaca crypto orders/positions may carry legacy no-slash symbols (e.g. "BTCUSD");
+        the broker resolves either form by asset_id to the same canonical "BASE/USD" asset.
+        """
+        if is_crypto_pair(symbol):
+            return symbol
+        if self.client is None:
+            raise ValueError("Alpaca paper client is unavailable")
+        asset = cast(Asset, self.client.get_asset(asset_id if asset_id is not None else symbol))
+        if asset.asset_class != AssetClass.CRYPTO or not is_crypto_pair(asset.symbol):
+            raise ValueError("Legacy crypto symbol did not resolve to a USD-quoted crypto asset")
+        return asset.symbol
+
+    def _reconcile_crypto_symbol(self, obj: Any) -> None:
+        """Normalize a crypto Order/Position's legacy no-slash symbol in place before any
+        dictionary lookup, migrating an exit target persisted under the legacy key.
+        """
+        symbol = getattr(obj, "symbol", None)
+        if getattr(obj, "asset_class", None) != "crypto" or not symbol or is_crypto_pair(symbol):
+            return
+        canonical = self._canonical_crypto_symbol(symbol, getattr(obj, "asset_id", None))
+        obj.symbol = canonical
+        if symbol in self.exits:
+            merged = {**self.exits.pop(symbol), **self.exits.get(canonical, {})}
+            self.exits[canonical] = merged
+            db.save_exits(canonical, merged)
+            db.delete_exits(symbol)
+
+    def search_assets(self, query: str, asset_class: str = "us_equity") -> list[dict[str, str]]:
+        if asset_class not in ("us_equity", "crypto"):
+            raise ValueError("Unsupported asset class")
         query = query.strip().upper()
         if not query or len(query) > 80:
             return []
         with self.lock:
             client = self._ready()
-            if self.asset_directory is None:
+            cls = AssetClass.CRYPTO if asset_class == "crypto" else AssetClass.US_EQUITY
+            cache_attr = "crypto_asset_directory" if asset_class == "crypto" else "asset_directory"
+            if getattr(self, cache_attr) is None:
                 assets = cast(
                     list[Asset],
                     client.get_all_assets(
-                        GetAssetsRequest(
-                            status=AssetStatus.ACTIVE,
-                            asset_class=AssetClass.US_EQUITY,
-                        )
+                        GetAssetsRequest(status=AssetStatus.ACTIVE, asset_class=cls)
                     ),
                 )
-                self.asset_directory = [
-                    {"symbol": a.symbol, "name": a.name or a.symbol}
-                    for a in assets
-                    if a.tradable
-                    and a.status == AssetStatus.ACTIVE
-                    and a.asset_class == AssetClass.US_EQUITY
-                ]
-            matches = [
-                a
-                for a in self.asset_directory
-                if query in a["symbol"] or query in a["name"].upper()
-            ]
+                setattr(
+                    self,
+                    cache_attr,
+                    [
+                        {"symbol": a.symbol, "name": a.name or a.symbol}
+                        for a in assets
+                        if a.tradable
+                        and a.status == AssetStatus.ACTIVE
+                        and a.asset_class == cls
+                        and (asset_class != "crypto" or is_crypto_pair(a.symbol))
+                    ],
+                )
+            directory = getattr(self, cache_attr)
+            matches = [a for a in directory if query in a["symbol"] or query in a["name"].upper()]
             return sorted(
                 matches,
                 key=lambda a: (
@@ -202,6 +314,14 @@ class PaperTrader:
             == "us_option"
         )
 
+    def is_crypto(self, symbol: str) -> bool:
+        if (
+            self.instruments.get(symbol, self.positions.get(symbol, {})).get("asset_class")
+            == "crypto"
+        ):
+            return True
+        return is_crypto_pair(symbol) or symbol in self.scope.crypto_symbols
+
     def symbols(self) -> tuple[str, ...]:
         with self.lock:
             candidates = [
@@ -213,12 +333,13 @@ class PaperTrader:
             viewed = [
                 s for s, requested in self.chart_requests.items() if time.time() - requested <= 30
             ]
-            selected = [self.scope.stock_symbol] if self.scope.stock_symbol else []
+            selected = [s for s in (self.scope.stock_symbol, self.scope.crypto_symbol) if s]
             return tuple(
                 dict.fromkeys(
                     [
                         *self.scope.stock_symbols,
                         *self.scope.option_underlyings,
+                        *self.scope.crypto_symbols,
                         *candidates,
                         *self.positions,
                         *pending,
@@ -241,7 +362,11 @@ class PaperTrader:
                 with self.lock:
                     if self.client is None or any(
                         s not in self.instruments
-                        for s in (*self.scope.stock_symbols, *self.scope.option_underlyings)
+                        for s in (
+                            *self.scope.stock_symbols,
+                            *self.scope.option_underlyings,
+                            *self.scope.crypto_symbols,
+                        )
                     ):
                         self._connect()
                     self.refresh()
@@ -253,6 +378,7 @@ class PaperTrader:
             time.sleep(3)
 
     def _record_order(self, order: Any) -> dict[str, Any]:
+        self._reconcile_crypto_symbol(order)
         previous = self.orders.get(order.client_order_id, {})
         record = {
             **previous,
@@ -320,6 +446,7 @@ class PaperTrader:
         )
         seen = set()
         for broker_order in broker_orders:
+            self._reconcile_crypto_symbol(broker_order)
             if (
                 getattr(broker_order, "asset_class", None) == "us_option"
                 and broker_order.status.value not in TERMINAL
@@ -327,6 +454,13 @@ class PaperTrader:
                 and broker_order.symbol not in self.instruments
             ):
                 self._register_option(broker_order.symbol)
+            elif (
+                getattr(broker_order, "asset_class", None) == "crypto"
+                and broker_order.status.value not in TERMINAL
+                and broker_order.symbol is not None
+                and broker_order.symbol not in self.instruments
+            ):
+                self.instruments[broker_order.symbol] = self._crypto_metadata(broker_order.symbol)
             seen.add(broker_order.client_order_id)
             self._record_order(broker_order)
         for client_id, order in list(self.orders.items()):
@@ -339,8 +473,11 @@ class PaperTrader:
                     # An ambiguous submission is not safe to repeat, even after a 404.
         positions = {}
         for p in cast(list[Position], self.client.get_all_positions()):
+            self._reconcile_crypto_symbol(p)
             if p.asset_class.value == "us_option" and p.symbol not in self.instruments:
                 self._register_option(p.symbol)
+            elif p.asset_class.value == "crypto" and p.symbol not in self.instruments:
+                self.instruments[p.symbol] = self._crypto_metadata(p.symbol)
             entry = float(p.avg_entry_price)
             targets = self.exits.get(p.symbol, {})
             multiplier = self.instruments.get(p.symbol, {}).get(
@@ -394,6 +531,8 @@ class PaperTrader:
             "options_buying_power": float(account.options_buying_power or 0),
             "options_trading_level": account.options_trading_level or 0,
             "trading_blocked": account.trading_blocked or account.account_blocked,
+            "crypto_status": account.crypto_status.value if account.crypto_status else None,
+            "crypto_buying_power": max(0.0, float(account.non_marginable_buying_power or 0)),
         }
         self.synced_at = time.time()
         self.broker_status, self.broker_error = "connected", None
@@ -415,16 +554,21 @@ class PaperTrader:
             scope = config.TradingScope.model_validate(
                 {**self.scope.model_dump(), **(trading_scope or {})}
             )
-            additions = set((*scope.stock_symbols, *scope.option_underlyings)) - set(
+            stock_additions = set((*scope.stock_symbols, *scope.option_underlyings)) - set(
                 (*self.scope.stock_symbols, *self.scope.option_underlyings)
             )
+            crypto_additions = set(scope.crypto_symbols) - set(self.scope.crypto_symbols)
             instruments = {}
-            if additions:
+            if stock_additions or crypto_additions:
                 self._ready()
-                for symbol in additions:
+                for symbol in stock_additions:
                     instruments[symbol] = self._stock_metadata(symbol)
                     if not instruments[symbol]["tradable"]:
                         raise ValueError(f"{symbol} is not an active tradable stock/ETF")
+                for symbol in crypto_additions:
+                    instruments[symbol] = self._crypto_metadata(symbol)
+                    if not instruments[symbol]["tradable"]:
+                        raise ValueError(f"{symbol} is not an active tradable crypto pair")
             capital = (
                 self.starting_cash if capital is None else positive(capital, "Strategy budget")
             )
@@ -452,7 +596,9 @@ class PaperTrader:
                 )
                 self.option_policy, self.scope = policy, scope
                 self.pending.maxsize = max(
-                    5, len(set(scope.stock_symbols + scope.option_underlyings)) * 10
+                    5,
+                    len(set(scope.stock_symbols + scope.option_underlyings + scope.crypto_symbols))
+                    * 10,
                 )
                 self.instruments.update(instruments)
                 self.option_scans = {
@@ -506,6 +652,8 @@ class PaperTrader:
                         "cash_balance": None,
                         "equity": None,
                         "available_cash": None,
+                        "crypto_status": None,
+                        "crypto_buying_power": None,
                         **self.account,
                         "starting_cash": self.starting_cash,
                         "positions": self.positions,
@@ -578,6 +726,12 @@ class PaperTrader:
             quotes = self.option_data.get_option_latest_quote(
                 OptionLatestQuoteRequest(symbol_or_symbols=symbol, feed=config.OPTION_FEED)
             )
+        elif self.is_crypto(symbol):
+            if self.crypto_data is None:
+                raise ValueError("Crypto data client is unavailable")
+            quotes = self.crypto_data.get_crypto_latest_quote(
+                CryptoLatestQuoteRequest(symbol_or_symbols=symbol), feed=config.CRYPTO_FEED
+            )
         else:
             if self.stock_data is None:
                 raise ValueError("Stock data client is unavailable")
@@ -634,6 +788,7 @@ class PaperTrader:
                 max(0, order["quantity"] - order["filled_qty"])
                 * order["estimated_price"]
                 * order["multiplier"]
+                * (1 + CRYPTO_TAKER_FEE if self.is_crypto(order["symbol"]) else 1)
             )
         held = max(0, self.positions.get(symbol, {}).get("market_value", 0))
         per_symbol = (
@@ -647,6 +802,8 @@ class PaperTrader:
         )
         if self.is_option(symbol):
             capacity = min(capacity, self.account["options_buying_power"])
+        elif self.is_crypto(symbol):
+            capacity = min(capacity, self.account["crypto_buying_power"])
         return max(0, capacity)
 
     def _option_capacity(self, underlying: str, symbol: str | None = None) -> float:
@@ -704,6 +861,8 @@ class PaperTrader:
         amount_usd=None,
         pct_of_position=1.0,
         limit_price=None,
+        stop_price=None,
+        time_in_force=None,
         source="manual",
         targets=None,
         expected_price=None,
@@ -719,7 +878,17 @@ class PaperTrader:
             instrument = self.instruments[symbol]
             if side == "buy" and not instrument["tradable"]:
                 raise ValueError("Asset is not tradable")
-            if not cast(Clock, client.get_clock()).is_open:
+            crypto = self.is_crypto(symbol)
+            if crypto and self.account.get("crypto_status") != "ACTIVE":
+                raise ValueError("Alpaca account is not eligible for crypto trading")
+            if not crypto and (stop_price is not None or time_in_force is not None):
+                raise ValueError("stop_price and time_in_force are crypto-only order parameters")
+            if time_in_force is not None and time_in_force not in ("gtc", "ioc"):
+                raise ValueError("time_in_force must be gtc or ioc")
+            tif = TimeInForce.GTC if crypto else TimeInForce.DAY
+            if time_in_force is not None:
+                tif = TimeInForce(time_in_force)
+            if not crypto and not cast(Clock, client.get_clock()).is_open:
                 raise ValueError("Regular market session is closed")
             option = self.is_option(symbol)
             candidate = None
@@ -741,6 +910,9 @@ class PaperTrader:
                     policy=self.option_policy,
                 )
                 self.instruments[symbol] = instrument = candidate
+            elif crypto and side == "buy":
+                if symbol not in self.scope.crypto_symbols:
+                    raise ValueError("Crypto pair is not in the entry watchlist")
             elif side == "buy" and symbol not in self.scope.stock_symbols:
                 raise ValueError("Stock is not in the stock-entry watchlist")
             quote = candidate["limit_price"] if candidate else self._quote(symbol, side)
@@ -753,6 +925,16 @@ class PaperTrader:
             )
             if limit is not None:
                 positive(limit, "Limit price")
+                if crypto:
+                    limit = crypto_price(limit, instrument)
+            if stop_price is not None:
+                stop_price = positive(stop_price, "Stop price")
+                if crypto:
+                    stop_price = crypto_price(stop_price, instrument)
+                if limit is None:
+                    raise ValueError("A stop-limit order requires both stop_price and limit_price")
+                if tif != TimeInForce.GTC:
+                    raise ValueError("Crypto stop-limit orders require gtc time in force")
             price = limit if limit is not None else quote
             multiplier = instrument["multiplier"]
             held = self.positions.get(symbol, {})
@@ -760,6 +942,9 @@ class PaperTrader:
                 quantity = positive(quantity, "Quantity")
                 if option and not quantity.is_integer():
                     raise ValueError("Options require whole contracts")
+                if crypto:
+                    quantity = crypto_quantity(quantity, instrument, floor=False)
+            fee_multiplier = 1 + CRYPTO_TAKER_FEE if crypto else 1.0
             if side == "buy":
                 if quantity is not None and amount_usd is not None:
                     raise ValueError("Specify quantity or amount_usd, not both")
@@ -774,14 +959,23 @@ class PaperTrader:
                 if quantity is None:
                     if allocation > available:
                         raise ValueError("Amount exceeds available cash or position budget")
-                    quantity = rounded_quantity(
-                        allocation / (price * multiplier), option or not instrument["fractionable"]
+                    quantity = (
+                        crypto_quantity(
+                            allocation / fee_multiplier / (price * multiplier),
+                            instrument,
+                            floor=True,
+                        )
+                        if crypto
+                        else rounded_quantity(
+                            allocation / (price * multiplier),
+                            option or not instrument["fractionable"],
+                        )
                     )
                 if candidate and quantity > candidate["max_quantity"]:
                     raise ValueError(
                         "Quantity exceeds option risk budget, contract cap, or available quote depth"
                     )
-                if quantity * price * multiplier > available + 1e-8:
+                if quantity * price * multiplier * fee_multiplier > available + 1e-8:
                     raise ValueError("Order exceeds available cash or position budget")
             else:
                 available = max(0, min(held.get("quantity", 0), held.get("available_quantity", 0)))
@@ -789,7 +983,11 @@ class PaperTrader:
                     fraction = positive(pct_of_position, "Position fraction")
                     if fraction > 1:
                         raise ValueError("Position fraction cannot exceed 1")
-                    quantity = rounded_quantity(available * fraction, option)
+                    quantity = (
+                        crypto_quantity(available * fraction, instrument, floor=True)
+                        if crypto
+                        else rounded_quantity(available * fraction, option)
+                    )
                 if quantity > available:
                     raise ValueError("Sell exceeds available long position; shorting is disabled")
             positive(quantity, "Order quantity")
@@ -800,14 +998,17 @@ class PaperTrader:
                 symbol=symbol,
                 qty=quantity,
                 side=OrderSide(side),
-                time_in_force=TimeInForce.DAY,
+                time_in_force=tif,
                 client_order_id=client_id,
-                position_intent=PositionIntent.BUY_TO_OPEN
-                if side == "buy"
-                else PositionIntent.SELL_TO_CLOSE,
             )
+            if not crypto:
+                args["position_intent"] = (
+                    PositionIntent.BUY_TO_OPEN if side == "buy" else PositionIntent.SELL_TO_CLOSE
+                )
             request = (
-                LimitOrderRequest(**args, limit_price=limit)
+                StopLimitOrderRequest(**args, stop_price=stop_price, limit_price=limit)
+                if stop_price is not None
+                else LimitOrderRequest(**args, limit_price=limit)
                 if limit is not None
                 else MarketOrderRequest(**args)
             )
@@ -855,6 +1056,8 @@ class PaperTrader:
         take_profit_price=None,
         timeframe="1m",
         limit_price=None,
+        stop_price=None,
+        time_in_force=None,
         source="manual",
     ):
         with self.lock:
@@ -879,6 +1082,8 @@ class PaperTrader:
                 quantity,
                 amount_usd,
                 limit_price=limit_price,
+                stop_price=stop_price,
+                time_in_force=time_in_force,
                 source=source,
                 targets=targets,
             )
@@ -891,6 +1096,8 @@ class PaperTrader:
         pct_of_position=1.0,
         timeframe="1m",
         limit_price=None,
+        stop_price=None,
+        time_in_force=None,
         source="manual",
     ):
         return self._order(
@@ -899,6 +1106,8 @@ class PaperTrader:
             quantity=quantity,
             pct_of_position=pct_of_position,
             limit_price=limit_price,
+            stop_price=stop_price,
+            time_in_force=time_in_force,
             source=source,
         )
 
@@ -956,9 +1165,13 @@ class PaperTrader:
             if symbol not in self.positions:
                 return None
             targets = self.exits.get(symbol, {})
+            crypto = self.is_crypto(symbol)
+            latched = crypto and bool(targets.get("exit_reason"))
             sl, tp = targets.get("stop_loss_price"), targets.get("take_profit_price")
             reason = (
-                "stop_loss"
+                targets.get("exit_reason")
+                if latched
+                else "stop_loss"
                 if sl and current_price <= sl
                 else "take_profit"
                 if tp and current_price >= tp
@@ -966,13 +1179,20 @@ class PaperTrader:
             )
             if reason:
                 self._ready()
-                # The fresh executable-side quote must also cross the target.
+                # The fresh executable-side quote must also cross the target, unless a crypto
+                # exit was already latched: a later price recovery must not abandon it.
                 bid = self._quote(symbol, "sell")
-                if (reason == "stop_loss" and sl is not None and bid <= sl) or (
-                    reason == "take_profit" and tp is not None and bid >= tp
+                if (
+                    latched
+                    or (reason == "stop_loss" and sl is not None and bid <= sl)
+                    or (reason == "take_profit" and tp is not None and bid >= tp)
                 ):
                     if self.is_option(symbol):
                         return self._drive_option_exit(symbol, reason)
+                    if crypto and not latched:
+                        targets.update(exit_reason=reason, exit_requested_at=time.time())
+                        db.save_exits(symbol, targets)
+                        self.exits[symbol] = targets
                     pending = self._open_orders(symbol)
                     if pending:
                         for order in pending:
@@ -1235,6 +1455,13 @@ class PaperTrader:
             if strategy == "options":
                 if not self.scope.options_enabled or symbol not in self.scope.option_underlyings:
                     return
+            elif strategy == "crypto":
+                if (
+                    not self.scope.crypto_enabled
+                    or symbol != self.scope.crypto_symbol
+                    or symbol not in self.scope.crypto_symbols
+                ):
+                    return
             elif (
                 strategy != "stock"
                 or not self.scope.stock_enabled
@@ -1343,6 +1570,8 @@ class PaperTrader:
     def _apply_decision(self, state: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
         if state.get("strategy") == "options":
             return self._apply_option_decision(state, response)
+        if state.get("strategy") == "crypto":
+            self._fresh_underlying(state)
         self._ready()
         answers = response.get("answers", {})
         answer = answers.get("action_choice", {})
@@ -1351,7 +1580,7 @@ class PaperTrader:
         event = {
             "timestamp": time.time(),
             "symbol": state["symbol"],
-            "strategy": "stock",
+            "strategy": state.get("strategy", "stock"),
             "time_frame": state.get("time_frame"),
             "price": state["current_price"],
             "action": action,

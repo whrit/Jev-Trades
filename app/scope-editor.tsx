@@ -8,25 +8,33 @@ export type TradingScope = {
   stock_symbol: string;
   stock_enabled: boolean;
   options_enabled: boolean;
+  crypto_symbols: string[];
+  crypto_symbol: string;
+  crypto_enabled: boolean;
 };
 
 type Asset = { symbol: string; name: string };
+
+type ScopeMode = "equities" | "crypto";
 
 export default function ScopeEditor({
   saved,
   running,
   feedBase,
   onSaved,
+  mode,
 }: {
   saved: TradingScope;
   running: boolean;
   feedBase: string;
   onSaved: (scope: TradingScope) => void;
+  mode: ScopeMode;
 }) {
   const [draft, setDraft] = useState<TradingScope | null>(null);
   const [target, setTarget] = useState<"option_underlyings" | "stock_symbols">(
     "option_underlyings",
   );
+  const searchTarget = mode === "crypto" ? "crypto_symbols" : target;
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<Asset[]>([]);
   const [searchState, setSearchState] = useState("");
@@ -42,8 +50,10 @@ export default function ScopeEditor({
     const timer = setTimeout(async () => {
       if (!query.trim()) return;
       try {
+        const assetClass =
+          searchTarget === "crypto_symbols" ? "crypto" : "us_equity";
         const response = await fetch(
-          `${feedBase}/assets?query=${encodeURIComponent(query.trim())}`,
+          `${feedBase}/assets?asset_class=${assetClass}&query=${encodeURIComponent(query.trim())}`,
           { signal: controller.signal },
         );
         const result = await response.json();
@@ -52,7 +62,11 @@ export default function ScopeEditor({
         if (controller.signal.aborted) return;
         setResults(result.assets);
         setSearchState(
-          result.assets.length ? "" : "No matching tradable stocks or ETFs.",
+          result.assets.length
+            ? ""
+            : assetClass === "crypto"
+              ? "No matching tradable crypto pairs."
+              : "No matching tradable stocks or ETFs.",
         );
       } catch (error) {
         if (!controller.signal.aborted)
@@ -67,32 +81,41 @@ export default function ScopeEditor({
       clearTimeout(timer);
       controller.abort();
     };
-  }, [query, feedBase]);
+  }, [query, feedBase, searchTarget]);
 
   const change = (patch: Partial<TradingScope>) => {
     setDraft({ ...scope, ...patch });
     setFeedback(null);
   };
   const remove = (
-    field: "option_underlyings" | "stock_symbols",
+    field: "option_underlyings" | "stock_symbols" | "crypto_symbols",
     symbol: string,
   ) => {
     const remaining = scope[field].filter((item) => item !== symbol);
-    change(
-      field === "stock_symbols"
-        ? {
-            stock_symbols: remaining,
-            stock_symbol:
-              scope.stock_symbol === symbol
-                ? (remaining[0] ?? "")
-                : scope.stock_symbol,
-            stock_enabled: remaining.length > 0 && scope.stock_enabled,
-          }
-        : {
-            option_underlyings: remaining,
-            options_enabled: remaining.length > 0 && scope.options_enabled,
-          },
-    );
+    if (field === "stock_symbols") {
+      change({
+        stock_symbols: remaining,
+        stock_symbol:
+          scope.stock_symbol === symbol
+            ? (remaining[0] ?? "")
+            : scope.stock_symbol,
+        stock_enabled: remaining.length > 0 && scope.stock_enabled,
+      });
+    } else if (field === "crypto_symbols") {
+      change({
+        crypto_symbols: remaining,
+        crypto_symbol:
+          scope.crypto_symbol === symbol
+            ? (remaining[0] ?? "")
+            : scope.crypto_symbol,
+        crypto_enabled: remaining.length > 0 && scope.crypto_enabled,
+      });
+    } else {
+      change({
+        option_underlyings: remaining,
+        options_enabled: remaining.length > 0 && scope.options_enabled,
+      });
+    }
   };
   const save = async () => {
     if (!draft || saving) return;
@@ -114,8 +137,19 @@ export default function ScopeEditor({
       return;
     }
     if (
+      scope.crypto_enabled &&
+      (!scope.crypto_symbol ||
+        !scope.crypto_symbols.includes(scope.crypto_symbol))
+    ) {
+      setFeedback({
+        error: true,
+        text: "Choose a crypto strategy pair or turn crypto automation off.",
+      });
+      return;
+    }
+    if (
       !window.confirm(
-        `Save Alpaca PAPER trading scope?\n\nOptions watchlist: ${scope.option_underlyings.join(", ") || "empty"}\nOptions automation: ${scope.options_enabled ? "on" : "off"}\nStock watchlist: ${scope.stock_symbols.join(", ") || "empty"}\nStock automation: ${scope.stock_enabled ? "on — " + scope.stock_symbol : "off"}\n\nMaster automation stays ${running ? "ON; new decisions can use this scope immediately" : "PAUSED"}. Removing tickers blocks new entries; it does not cancel existing orders or close positions. Protective exits continue. Saved scope survives restart; master automation restarts paused.`,
+        `Save Alpaca PAPER trading scope? This applies account-wide, across both the equities/options and crypto views.\n\nOptions watchlist: ${scope.option_underlyings.join(", ") || "empty"}\nOptions automation: ${scope.options_enabled ? "on" : "off"}\nStock watchlist: ${scope.stock_symbols.join(", ") || "empty"}\nStock automation: ${scope.stock_enabled ? "on — " + scope.stock_symbol : "off"}\nCrypto watchlist: ${scope.crypto_symbols.join(", ") || "empty"}\nCrypto automation: ${scope.crypto_enabled ? "on — " + scope.crypto_symbol : "off"}\n\nMaster automation stays ${running ? "ON; new decisions can use this scope immediately" : "PAUSED"}. Removing tickers blocks new entries; it does not cancel existing orders or close positions. Protective exits continue. Saved scope survives restart; master automation restarts paused.`,
       )
     )
       return;
@@ -156,9 +190,14 @@ export default function ScopeEditor({
     >
       <div className="panel-head">
         <div>
-          <h2 id="scope-title">Trading scope</h2>
+          <h2 id="scope-title">
+            {mode === "crypto"
+              ? "Crypto trading scope"
+              : "Equities & options trading scope"}
+          </h2>
           <p className="muted">
-            Choose what Jev can trade. Viewing a chart never changes this scope.
+            Choose what Jev can trade. Applies account-wide; viewing a chart
+            never changes this scope.
           </p>
         </div>
         <span className={draft ? "draft-status" : "muted"}>
@@ -167,105 +206,164 @@ export default function ScopeEditor({
       </div>
       <fieldset disabled={saving}>
         <legend className="sr-only">Trading watchlists and strategies</legend>
-        <div className="scope-columns">
-          <div>
-            <label className="toggle-label">
-              <input
-                type="checkbox"
-                checked={scope.options_enabled}
-                onChange={(event) =>
-                  change({ options_enabled: event.target.checked })
-                }
-              />
-              Options automation
-            </label>
-            <p className="muted">
-              Scans calls and puts across these underlying tickers.
-            </p>
-            <div className="ticker-chips" aria-label="Options watchlist">
-              {scope.option_underlyings.map((symbol) => (
-                <button
-                  type="button"
-                  key={symbol}
-                  onClick={() => remove("option_underlyings", symbol)}
-                  aria-label={`Remove ${symbol} from options watchlist`}
+        {mode === "equities" ? (
+          <div className="scope-columns">
+            <div>
+              <label className="toggle-label">
+                <input
+                  type="checkbox"
+                  checked={scope.options_enabled}
+                  onChange={(event) =>
+                    change({ options_enabled: event.target.checked })
+                  }
+                />
+                Options automation
+              </label>
+              <p className="muted">
+                Scans calls and puts across these underlying tickers.
+              </p>
+              <div className="ticker-chips" aria-label="Options watchlist">
+                {scope.option_underlyings.map((symbol) => (
+                  <button
+                    type="button"
+                    key={symbol}
+                    onClick={() => remove("option_underlyings", symbol)}
+                    aria-label={`Remove ${symbol} from options watchlist`}
+                  >
+                    {symbol}
+                    <span aria-hidden="true">×</span>
+                  </button>
+                ))}
+                {!scope.option_underlyings.length && (
+                  <span className="muted">
+                    No options underlyings selected.
+                  </span>
+                )}
+              </div>
+            </div>
+            <div>
+              <label className="toggle-label">
+                <input
+                  type="checkbox"
+                  checked={scope.stock_enabled}
+                  onChange={(event) =>
+                    change({ stock_enabled: event.target.checked })
+                  }
+                />
+                Stock automation
+              </label>
+              <p className="muted">
+                One active stock strategy; the watchlist also permits manual
+                stock entries.
+              </p>
+              <div className="ticker-chips" aria-label="Stock watchlist">
+                {scope.stock_symbols.map((symbol) => (
+                  <button
+                    type="button"
+                    key={symbol}
+                    onClick={() => remove("stock_symbols", symbol)}
+                    aria-label={`Remove ${symbol} from stock watchlist`}
+                  >
+                    {symbol}
+                    <span aria-hidden="true">×</span>
+                  </button>
+                ))}
+                {!scope.stock_symbols.length && (
+                  <span className="muted">No stock entries configured.</span>
+                )}
+              </div>
+              <label className="field">
+                Stock strategy symbol
+                <select
+                  value={scope.stock_symbol}
+                  onChange={(event) =>
+                    change({ stock_symbol: event.target.value })
+                  }
                 >
-                  {symbol}
-                  <span aria-hidden="true">×</span>
-                </button>
-              ))}
-              {!scope.option_underlyings.length && (
-                <span className="muted">No options underlyings selected.</span>
-              )}
+                  <option value="">Select a ticker</option>
+                  {scope.stock_symbols.map((symbol) => (
+                    <option key={symbol}>{symbol}</option>
+                  ))}
+                </select>
+              </label>
             </div>
           </div>
+        ) : (
           <div>
             <label className="toggle-label">
               <input
                 type="checkbox"
-                checked={scope.stock_enabled}
+                checked={scope.crypto_enabled}
                 onChange={(event) =>
-                  change({ stock_enabled: event.target.checked })
+                  change({ crypto_enabled: event.target.checked })
                 }
               />
-              Stock automation
+              Crypto automation
             </label>
             <p className="muted">
-              One active stock strategy; the watchlist also permits manual stock
-              entries.
+              Trades a single crypto pair 24/7, no margin or short selling; the
+              watchlist also permits manual crypto entries.
             </p>
-            <div className="ticker-chips" aria-label="Stock watchlist">
-              {scope.stock_symbols.map((symbol) => (
+            <div className="ticker-chips" aria-label="Crypto watchlist">
+              {scope.crypto_symbols.map((symbol) => (
                 <button
                   type="button"
                   key={symbol}
-                  onClick={() => remove("stock_symbols", symbol)}
-                  aria-label={`Remove ${symbol} from stock watchlist`}
+                  onClick={() => remove("crypto_symbols", symbol)}
+                  aria-label={`Remove ${symbol} from crypto watchlist`}
                 >
                   {symbol}
                   <span aria-hidden="true">×</span>
                 </button>
               ))}
-              {!scope.stock_symbols.length && (
-                <span className="muted">No stock entries configured.</span>
+              {!scope.crypto_symbols.length && (
+                <span className="muted">No crypto pairs selected.</span>
               )}
             </div>
             <label className="field">
-              Stock strategy symbol
+              Crypto strategy pair
               <select
-                value={scope.stock_symbol}
+                value={scope.crypto_symbol}
                 onChange={(event) =>
-                  change({ stock_symbol: event.target.value })
+                  change({ crypto_symbol: event.target.value })
                 }
               >
-                <option value="">Select a ticker</option>
-                {scope.stock_symbols.map((symbol) => (
+                <option value="">Select a pair</option>
+                {scope.crypto_symbols.map((symbol) => (
                   <option key={symbol}>{symbol}</option>
                 ))}
               </select>
             </label>
           </div>
-        </div>
+        )}
         <div className="asset-search">
-          <label className="field">
-            Add to
-            <select
-              value={target}
-              onChange={(event) =>
-                setTarget(event.target.value as typeof target)
-              }
-            >
-              <option value="option_underlyings">Options watchlist</option>
-              <option value="stock_symbols">Stock watchlist</option>
-            </select>
-          </label>
+          {mode === "equities" && (
+            <label className="field">
+              Add to
+              <select
+                value={target}
+                onChange={(event) =>
+                  setTarget(event.target.value as typeof target)
+                }
+              >
+                <option value="option_underlyings">Options watchlist</option>
+                <option value="stock_symbols">Stock watchlist</option>
+              </select>
+            </label>
+          )}
           <label className="field search-field">
-            Search ticker or company
+            {mode === "crypto"
+              ? "Search crypto pair"
+              : "Search ticker or company"}
             <input
               type="search"
               value={query}
               maxLength={80}
-              placeholder="Search SPY, Apple, Microsoft…"
+              placeholder={
+                mode === "crypto"
+                  ? "Search BTC, ETH, SOL…"
+                  : "Search SPY, Apple, Microsoft…"
+              }
               onChange={(event) => {
                 setQuery(event.target.value);
                 setResults([]);
@@ -283,12 +381,16 @@ export default function ScopeEditor({
               <button
                 type="button"
                 key={asset.symbol}
-                disabled={scope[target].includes(asset.symbol)}
+                disabled={scope[searchTarget].includes(asset.symbol)}
                 onClick={() =>
                   change({
-                    [target]: [...scope[target], asset.symbol],
-                    ...(target === "stock_symbols" && !scope.stock_symbol
+                    [searchTarget]: [...scope[searchTarget], asset.symbol],
+                    ...(searchTarget === "stock_symbols" && !scope.stock_symbol
                       ? { stock_symbol: asset.symbol }
+                      : {}),
+                    ...(searchTarget === "crypto_symbols" &&
+                    !scope.crypto_symbol
+                      ? { crypto_symbol: asset.symbol }
                       : {}),
                   })
                 }
@@ -296,17 +398,16 @@ export default function ScopeEditor({
                 <strong>{asset.symbol}</strong>
                 <span>{asset.name}</span>
                 <span>
-                  {scope[target].includes(asset.symbol) ? "Added" : "Add"}
+                  {scope[searchTarget].includes(asset.symbol) ? "Added" : "Add"}
                 </span>
               </button>
             ))}
           </div>
         )}
         <p className="help-text">
-          Search uses Alpaca’s active tradable stock/ETF directory. Options
-          eligibility is checked during scanning. Turn stock automation off for
-          options-only automation; empty the stock watchlist to also disallow
-          new manual stock entries.
+          {mode === "crypto"
+            ? "Search uses Alpaca’s tradable USD-quoted crypto pairs. Crypto trades 24/7 with no margin or short selling; Alpaca charges taker fees up to 0.25%."
+            : "Search uses Alpaca’s active tradable stock/ETF directory. Options eligibility is checked during scanning. Turn stock automation off for options-only automation; empty the stock watchlist to also disallow new manual stock entries."}
         </p>
         <div className="form-actions">
           <button

@@ -60,6 +60,9 @@ class HttpValidation(unittest.TestCase):
                         ("trading_scope", {"stock_enabled": "false"}),
                         ("trading_scope", {"option_underlyings": "SPY,QQQ"}),
                         ("trading_scope", {"option_underlyings": [42]}),
+                        ("trading_scope", {"crypto_enabled": "true"}),
+                        ("trading_scope", {"crypto_symbols": "BTC/USD"}),
+                        ("trading_scope", {"crypto_symbols": [False]}),
                         ("trading_scope", {"unknown": True}),
                         ("symbol", "SPY"),
                     ):
@@ -78,6 +81,16 @@ class HttpValidation(unittest.TestCase):
                     self.assertEqual(status, 400)
                     self.assertIn("quantity", response["error"])
                     self.assertEqual(db.get_orders(), [])
+                    for field, value in (
+                        ("stop_price", -1),
+                        ("stop_price", True),
+                        ("time_in_force", "day"),
+                        ("time_in_force", 1),
+                    ):
+                        status, response = post("/order", {"action": "buy", field: value})
+                        self.assertEqual(status, 400)
+                        self.assertIn(field, response["error"])
+                        self.assertEqual(db.get_orders(), [])
                     limits = {
                         "max_trade_pct": 0.12,
                         "max_underlying_pct": 0.30,

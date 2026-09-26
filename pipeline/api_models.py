@@ -22,6 +22,9 @@ class TradingScopePatch(TypedDict, total=False):
     stock_symbol: str
     stock_enabled: bool
     options_enabled: bool
+    crypto_symbols: list[str]
+    crypto_symbol: str
+    crypto_enabled: bool
 
 
 @with_config(ConfigDict(strict=True, extra="forbid", allow_inf_nan=False))
@@ -44,6 +47,8 @@ class OrderPayload(TypedDict, total=False):
     quantity: PositiveFloat | None
     amount_usd: PositiveFloat | None
     limit_price: PositiveFloat | None
+    stop_price: PositiveFloat | None
+    time_in_force: Literal["gtc", "ioc"] | None
     pct_of_position: Annotated[float, Field(gt=0, le=1)]
     stop_loss_pct: NonNegativeFloat | None
     stop_loss_price: NonNegativeFloat | None

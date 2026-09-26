@@ -1,8 +1,8 @@
 # Jev Trades
 
-A Next.js dashboard for Alpaca market data and paper trading of US stocks and long calls/puts, with optional TypeSafe/Jev automation.
+A Next.js dashboard for Alpaca market data and paper trading of US stocks, long calls/puts, and USD-quoted crypto pairs, with optional TypeSafe/Jev automation.
 
-Crypto is not implemented in this app. Alpaca supports it, but this service currently validates US-equity watchlists and uses stock/options data clients and order rules; adding a crypto ticker does not enable crypto trading.
+Use the **Equities & options / Crypto** workspace switch to keep watchlists, charts, order entry, positions, activity, and strategy settings separate. Both workspaces use the same Alpaca paper account: cash, equity, strategy budget, and master automation are account-wide. Switching views never changes a strategy.
 
 **Paper only:** `TradingClient(..., paper=True)` is fixed in the Python service. There is no live-trading switch. Orders go to Alpaca's paper brokerage; acceptance is not a fill. Alpaca—not SQLite—is authoritative for cash, positions, fills, exercise/assignment effects, and buying power.
 
@@ -19,7 +19,7 @@ cp .env.example .env.local
 cp pipeline/.env.example pipeline/.env
 ```
 
-Edit `pipeline/.env` to set `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` from a **paper** account. The example includes stock symbols, an option-underlying watchlist, data feeds, hard option policy, optional TypeSafe credentials, and local listener/origin settings. Blank credentials leave trading unavailable. Existing shell variables take precedence over `pipeline/.env`.
+Edit `pipeline/.env` to set `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` from a **paper** account. The example includes stock, option-underlying, and crypto watchlists, data feeds, option policy, optional TypeSafe credentials, and listener/origin settings. Blank credentials leave trading unavailable; public crypto REST data does not require credentials. Existing shell variables take precedence.
 
 The root `.env.local` contains only public dashboard feed URLs. Its example keeps the local defaults; `NEXT_PUBLIC_MARKET_STREAM_URL` is an optional override of the feed URL plus `/stream`. Restart Next.js after changing these values. Do not overwrite existing environment files when upgrading.
 
@@ -64,21 +64,30 @@ curl 'http://127.0.0.1:8765/contracts?underlying=SPY&expiration=2026-12-18'
 
 The response includes `option_contracts` and `next_page_token`; pass `page_token` for later pages. This raw discovery endpoint does not certify entry eligibility. The date is illustrative, not a promise of availability or a trading recommendation.
 
+## Crypto
+
+- Add pairs through **Crypto → Settings → Trading scope**, searching Alpaca’s active tradable crypto directory. Use canonical pairs such as `BTC/USD` and `ETH/USD`, not equity-style `BTCUSD`. This USD cash-account workflow supports USD-quoted spot pairs, not crypto derivatives, leverage, shorting, or transfers.
+- `ALPACA_CRYPTO_SYMBOLS` is the optional bootstrap watchlist. Crypto automation defaults **off**, including when upgrading an existing saved scope. Select a crypto strategy pair, enable its independent strategy switch, and separately confirm master automation to permit automatic orders. Chart selection does not change the strategy pair.
+- Crypto trades 24/7 without the equity-session gate. Market and limit orders support GTC or IOC; stop-limit orders require a stop price, limit price, and GTC. A stop-limit trigger does not guarantee a fill. Existing cancel, partial/full sell, and local TP/SL controls apply.
+- Minimum order sizes, quantity increments, and price increments come from Alpaca metadata rather than hard-coded BTC precision. Automatically sized quantities round down; invalid explicit sizes/prices are rejected. Buys use cash/non-marginable buying power and shared strategy limits. Broker fees and fee-adjusted available holdings affect sizing/exits; broker reconciliation is authoritative.
+- `CryptoHistoricalDataClient` supplies US-feed history and quotes. `CryptoDataStream` supplies live quotes, minute bars, and corrections, with REST polling/history refresh retained for recovery. Subscriptions follow watchlists, viewed symbols, pending orders, and positions; removing an entry pair does not abandon holdings. Crypto daily indicators use UTC boundaries.
+- Protective exits require this service and fresh quotes; they are not broker-hosted bracket/OCO orders. A 24/7 market does not eliminate outage, slippage, liquidity, fee, or dust risks.
+
 ## Market data
 
-Both stocks and options use Alpaca's historical data clients:
+Stocks/options use REST polling; crypto adds WebSocket streaming and retains REST history/quote recovery:
 
-- All configured stock symbols and option underlyings are watched independently of the selected chart. Underlying quotes and active contract charts are polled every five seconds; displayed prices are midpoints. The shortlist does not create a historical-bars subscription for every contract.
+- Configured stock symbols, option underlyings, and crypto pairs are watched independently of the chart. Quotes and active contract charts are polled every five seconds; displayed prices are midpoints. The options shortlist does not create a historical-bars subscription for every contract.
 - Completed one-minute OHLCV bars are polled every minute. Startup requests up to 1,000 recent bars per symbol from the preceding seven days; subsequent polls refresh the last five minutes.
 - Broker-provided bar timestamps are upsert keys. Corrections replace bars instead of double-counting volume. Quotes never fabricate candles or trade volume.
 - Charts support 1m, 5m, 15m, 1h, and 4h aggregation, existing moving averages, oscillators, and TP/SL overlays. Sparse or insufficient history displays warming indicators.
-- Cached bars are stored in `pipeline/alpaca_market_data/`. Cached or stale data is not represented as a live quote.
+- Cached bars are stored in `pipeline/alpaca_market_data/`; pair separators are percent-encoded (`BTC%2FUSD.json`), never interpreted as directories. Cached/stale data is not represented as live quotes.
 
-This implementation uses REST polling, not WebSocket streams. Broker reconciliation and option lifecycle monitoring run every three seconds; stock target checks use the market-data loop. These are not guaranteed exit latencies: broker/network delays add to each interval.
+Broker reconciliation and option lifecycle monitoring run every three seconds; stock/crypto target checks use fresh polled quotes, with crypto also checked on streamed quotes. These are not guaranteed exit latencies: broker/network delays add to each interval.
 
 `ALPACA_STOCK_FEED=iex` is the default; use `sip` only with the necessary entitlement. IEX is not the consolidated market. Options default to `indicative`, which supports automatic discovery, paper entries and monitored exits without an OPRA subscription. Its quotes are derived rather than executable OPRA/NBBO, and trades are delayed 15 minutes. Spread/depth filters measure that indicative feed; paper results do not establish live execution quality. Optional `opra` supplies consolidated quotes and requires a working entitlement. Requests always use the configured feed; entitlement errors are surfaced, not silently replaced with another feed. Historical option bars use the SDK endpoint without a feed selector; options and equities have different historical availability.
 
-Orders require a quote no more than 30 seconds old and an open regular market session. Automated decisions require a newly completed bar no more than three minutes old. Delayed subscriptions, quiet contracts, closed markets, and stale quotes can therefore prevent trading rather than bypass these guards.
+Orders require a quote no more than 30 seconds old. Stocks/options also require an open regular session; crypto does not. Automated decisions require newly completed bars no more than three minutes old. Delayed feeds, quiet instruments, closed equity markets, and stale quotes prevent trading rather than bypass these guards.
 
 ## Paper trading workflow
 
@@ -86,13 +95,15 @@ Orders require a quote no more than 30 seconds old and an open regular market se
 
 Unsaved settings survive live snapshots and navigation between workspace views. Scans retain their last completed counts, candidates, and timestamp while updating or reporting an error; failed/stale scans are not reused for automatic entries. Decision rows identify ticker, strategy, interval, action, confidence, and timestamp, with expandable actual context/response. Holds do not display invented execution prices.
 
-1. Select a configured underlying, an eligible shortlisted contract, or a broker-held position.
+1. Select a market workspace, then a configured stock/crypto pair, eligible shortlisted contract, or broker-held position.
 2. Set the **strategy budget**, maximum position percentage, and risk profile. Budget changes do **not** deposit, withdraw, reset, or otherwise change Alpaca cash. The budget covers long holdings plus estimated unfilled buy exposure across symbols; market movements and actual fill prices can exceed these estimates.
 3. Apply settings. Manual orders remain independent of the automation toggle.
-4. Submit a confirmed manual order, or confirm **Start automation** for the saved scope. Stock/options strategy switches independently gate automated work; viewing a chart never changes them. Strategy evaluation intervals are separate from the chart candle interval.
+4. Submit a confirmed manual order, or confirm **Start automation** for the saved scope. Stock, options, and crypto switches independently gate automated work; viewing charts or switching workspaces never changes them. Strategy evaluation intervals are separate from chart intervals.
 5. Monitor **Open orders** for acceptance, partial fills, rejection, expiration, and cancellation. A cancel request is not a confirmed cancellation. **Pause automation** stops new autonomous decisions; existing orders and protective exits remain active.
 
 Stocks use DAY market orders unless a limit price is supplied. Fractional shares require a fractionable asset. Options always use DAY limit orders, with an explicit premium limit or the current quote rounded to cents. Market-order slippage can exceed an estimated stock allocation; limits can remain unfilled. Submitted quantities are checked against current cash, buying power, the strategy's per-symbol position cap, and available long holdings. Sells cannot intentionally open a short position.
+
+Crypto defaults to GTC; market/limit orders also expose IOC. Stop-limit orders require GTC. Sizing includes a conservative crypto fee allowance, but market slippage can exceed estimates. Fee-adjusted remainders below broker minimums/increments may require broker-side resolution rather than invalid or oversized sells.
 
 All analysis timeframes share **one net broker position per symbol**. Manual orders, Jev orders, and broker-side changes appear in the same portfolio. Do not use timeframe labels as independent position allocations. Use a dedicated Alpaca paper account for this application, and run only one feed process against it.
 
@@ -133,6 +144,8 @@ Options percentages apply directly to the lesser of strategy budget and broker e
 
 A bounded, deduplicated queue drops work older than two minutes. Option decisions also require a fresh underlying quote and recent completed bars before inference and execution. Changing settings or pausing invalidates queued/in-flight decisions before submission; it does not cancel existing orders or disable lifecycle monitoring. The stock strategy retains its confidence, allocation and ATR behavior; option stops are premium percentages, not underlying ATR distances.
 
+The independent crypto strategy reuses stock confidence, allocation, and ATR-based decisions with crypto data and execution validation. Options discovery never receives crypto pairs. Shared account/budget limits apply across both workspaces.
+
 TypeSafe receives underlying indicators, the verified shortlist, held positions, policy and portfolio balances. Enable automation only if you intend to disclose that trading context to TypeSafe.
 
 ### TP/SL limitations
@@ -140,6 +153,8 @@ TypeSafe receives underlying indicators, the verified shortlist, held positions,
 TP/SL values are **local monitored exit targets**, not broker-hosted bracket/OCO protection. Held strategy options remain monitored while Jev is paused, after restart, and after their underlying is removed from the entry watchlist. Positions outside this strategy are not silently liquidated. Option exits use fresh quotes from the configured feed, including indicative. They do not execute while the service is down, quotes are unavailable/stale, or the regular session is closed. They are limit orders and may remain unfilled.
 
 Targets attach only after a confirmed partial/full fill. Triggered option exits are persisted: price recovery, restart or watchlist changes do not erase the exit request. Remaining buys are canceled before selling a partial fill. Existing sells are canceled before repricing; acknowledged cancellation is not confirmation, and ambiguous submissions stay blocked rather than duplicated. The dashboard exposes exit intent and monitoring errors.
+
+Crypto targets also remain monitored while automation is paused or their pair is removed from the entry watchlist. A triggered crypto exit is persisted before canceling pending buys, so restart or price recovery does not abandon the exit. Monitoring requires a running feed and fresh quotes; market exits are not guaranteed and fee-adjusted dust can be below broker sell minimums. Stock/crypto target prices use the entry request reference price, not a guarantee of the eventual fill price.
 
 The service attempts to close near-expiry strategy options and reconciles broker positions through removal/expiration. **This cannot guarantee liquidation before expiration or prevent exercise/delivery.** Closed sessions, outages and illiquidity can defeat the attempt. Review Alpaca directly for expiry, exercise and resulting underlying shares. The service neither rolls contracts nor manages delivered shares automatically.
 
@@ -155,6 +170,8 @@ Keep the SQLite database: submission intents, exit targets, saved watchlists/str
 
 OHLCV files are a rebuildable cache, not an audit ledger. A separate SQL market-data archive is unnecessary for the current dashboard; add one only for durable backtesting/history requirements. There is no automatic retention policy for persisted order and decision history.
 
+Crypto charts and order controls use broker tick/quantity precision. Indicator calculations retain sub-cent values rather than rounding small prices or ATR to zero.
+
 ## HTTP service and security
 
 | Endpoint                                              | Purpose                                                                                                     |
@@ -164,16 +181,19 @@ OHLCV files are a rebuildable cache, not an audit ledger. A separate SQL market-
 | `GET /history`                                        | Broker-derived order/fill summaries and account snapshot                                                    |
 | `GET /contracts?underlying=SPY&expiration=YYYY-MM-DD` | Paginated contract discovery                                                                                |
 | `GET /assets?query=apple`                             | Broker-backed active tradable stock/ETF search by ticker or name                                            |
+| `GET /assets?query=bitcoin&asset_class=crypto`        | Active tradable USD-quoted crypto-pair search                                                               |
 | `POST /config`                                        | Budget, stock risk, strategy timeframes, master automation, nested trading-scope and options-policy patches |
 | `POST /order`                                         | `buy`, `sell`, `exit`, `update_tp_sl`, or `cancel`                                                          |
 
-Order requests use the configured `symbol`, `quantity` **or** `amount_usd` for buys, optional `limit_price`, and optional `stop_loss_pct` / `take_profit_pct` or absolute targets. Sell requests accept `quantity` or `pct_of_position`; `exit` sells all available long holdings. `cancel` requires `order_id`. Zero TP/SL values in `update_tp_sl` remove the corresponding local target.
+Order requests use `symbol`, `quantity` **or** `amount_usd` for buys, optional `limit_price`, and optional `stop_loss_pct` / `take_profit_pct` or absolute local targets. Crypto also accepts `time_in_force` (`gtc` or `ioc`) and `stop_price` together with `limit_price` for GTC stop-limit orders. Stocks/options reject crypto-only parameters. Sells accept `quantity` or `pct_of_position`; `exit` sells available long holdings subject to broker increments/minimums. `cancel` requires `order_id`. Zero TP/SL values in `update_tp_sl` remove the corresponding target.
 
 Pydantic validates both mutation payloads: unknown fields, numeric strings/booleans, non-finite numbers, invalid actions, and malformed settings are rejected with HTTP 400 before mutation. Validation responses omit submitted input values to avoid echoing credentials. Broker-specific sizing, permissions, market-session, and quote-freshness checks remain in the execution layer.
 
 An options-policy update sends `{ "option_policy": { "max_trade_pct": 0.10, "max_underlying_pct": 0.25, "max_total_pct": 0.75, "max_positions_per_underlying": 10, "max_contracts": 5, "min_confidence": 0.60 } }`. All six fields are optional; omitted fields retain active values. This patch preserves budget, trading scope, timeframes, and automation state. Advanced eligibility/exit fields are not accepted here.
 
 Scope updates use `{ "trading_scope": { "stock_symbols": ["SPY", "AAPL"], "stock_symbol": "SPY", "stock_enabled": false, "option_underlyings": ["SPY", "QQQ"], "options_enabled": true } }`. Nested fields are optional; the merged complete scope must remain valid. Tickers are normalized/deduplicated, additions are validated with Alpaca, and scope/policy overrides are persisted together before activation. The old top-level `/config` `symbol` field is rejected: use `trading_scope.stock_symbol`; chart selection belongs to the SSE query. Responses include effective `settings`, `trading_scope`, `option_policy`, and `trading_enabled`; SSE also carries the effective scope. A strategy cannot be enabled with an empty entry list. Disabled strategies may have empty lists.
+
+Crypto scope patches use `{ "trading_scope": { "crypto_symbols": ["BTC/USD", "ETH/USD"], "crypto_symbol": "BTC/USD", "crypto_enabled": false } }`. The selected strategy must belong to its watchlist. Saving one workspace preserves the other scope. Pair validation happens before activation.
 
 The service binds to loopback by default. Browser origins are restricted to `http://localhost:3000` and `http://127.0.0.1:3000`; override with comma-separated `FEED_ALLOWED_ORIGINS` if necessary. Mutations require bounded JSON requests. `HOST` and `PORT` configure the listener.
 
@@ -212,12 +232,16 @@ pnpm build
 
 Offline regressions use temporary storage and controlled broker transitions. Coverage includes paginated discovery/filtering, indicative and OPRA eligibility, verified AI choices, execution revalidation, exact-cent sizing, premium budgets, partial fills, restart reconciliation, paused/watchlist-removed exits, repricing after cancellation, near-expiry handling, stale/invalid inputs, ambiguous submissions, corrected candle volumes, and HTTP validation without secret disclosure or partial settings changes. No account credentials or real broker orders are used.
 
+Crypto regressions cover pair/class validation, quote freshness, corrected candles and encoded cache paths, independent strategy dispatch, broker order constraints, and reconciliation. Transport smoke verification uses the real Alpaca SDK against an isolated protocol server; it does not certify permissions, connectivity, or fills for a real account.
+
 ## References
 
 - [Alpaca-py market data](https://alpaca.markets/sdks/python/market_data.html)
 - [Alpaca-py trading](https://alpaca.markets/sdks/python/trading.html)
 - [Alpaca-py options examples](https://github.com/alpacahq/alpaca-py/tree/master/examples/options)
 - [Alpaca-py Context7 documentation](https://context7.com/alpacahq/alpaca-py)
+- [Alpaca crypto trading](https://docs.alpaca.markets/us/docs/crypto-trading)
+- [Alpaca crypto fees](https://docs.alpaca.markets/us/docs/crypto-fees)
 - [Oxlint configuration](https://oxc.rs/docs/guide/usage/linter/config.html)
 - [Oxfmt configuration](https://oxc.rs/docs/guide/usage/formatter/config.html)
 

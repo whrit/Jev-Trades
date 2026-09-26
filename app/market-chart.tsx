@@ -34,11 +34,13 @@ export default function MarketChart({
   indicatorSeries,
   overlays,
   position,
+  priceFormat,
 }: {
   bars: Bar[];
   indicatorSeries: IndicatorSeries;
   overlays: string[];
   position?: PositionData | null;
+  priceFormat?: { minMove: number; precision: number };
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<ReturnType<typeof createChart> | null>(null);
@@ -90,6 +92,7 @@ export default function MarketChart({
       borderVisible: false,
       wickUpColor: "#82b5ff",
       wickDownColor: "#ef7156",
+      priceFormat: { type: "price", minMove: 0.01 },
     });
     const volume = chart.addSeries(HistogramSeries, {
       priceFormat: { type: "volume" },
@@ -113,6 +116,18 @@ export default function MarketChart({
       chartRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    for (const name of ["candles", "ema20", "sma50"] as const) {
+      seriesRef.current[name]?.applyOptions({
+        priceFormat: {
+          type: "price",
+          minMove: priceFormat?.minMove ?? 0.01,
+          precision: priceFormat?.precision ?? 2,
+        },
+      });
+    }
+  }, [priceFormat?.minMove, priceFormat?.precision]);
 
   useEffect(() => {
     const { candles, volume } = seriesRef.current;
@@ -194,6 +209,11 @@ export default function MarketChart({
           lineWidth: 2,
           priceLineVisible: false,
           lastValueVisible: false,
+          priceFormat: {
+            type: "price",
+            minMove: priceFormat?.minMove ?? 0.01,
+            precision: priceFormat?.precision ?? 2,
+          },
         });
       }
       const values =
@@ -213,7 +233,13 @@ export default function MarketChart({
       );
     }
     overlayStateRef.current = overlayState;
-  }, [bars, indicatorSeries, overlays]);
+  }, [
+    bars,
+    indicatorSeries,
+    overlays,
+    priceFormat?.minMove,
+    priceFormat?.precision,
+  ]);
 
   // Update Price Lines for Position Entry, Take Profit, and Stop Loss
   useEffect(() => {

@@ -192,6 +192,8 @@ type Trading = {
     available_cash: number | null;
     equity: number | null;
     options_exposure?: number | null;
+    crypto_status?: string | null;
+    crypto_buying_power?: number | null;
     positions: Record<string, Position>;
     max_wallet_position_pct: number;
     risk_appetite: string;
@@ -221,9 +223,12 @@ type Snapshot = {
       underlying?: string;
       expiration?: string;
       option_type?: "call" | "put";
+      min_order_size?: number | null;
+      min_trade_increment?: number | null;
+      price_increment?: number | null;
     }
   >;
-  data_feeds: { stocks: string; options: string };
+  data_feeds: { stocks: string; options: string; crypto: string };
   trading_enabled: boolean;
   price: number | null;
   bars: Bar[];
@@ -245,10 +250,50 @@ const feedBase =
   process.env.NEXT_PUBLIC_MARKET_FEED_URL ?? "http://127.0.0.1:8765";
 const streamBase =
   process.env.NEXT_PUBLIC_MARKET_STREAM_URL ?? `${feedBase}/stream`;
-const money = (value: number | null | undefined) =>
+const isCryptoTicker = (value: string) => value.includes("/");
+type InstrumentInfo = {
+  asset_class?: string;
+  price_increment?: number | null;
+  min_trade_increment?: number | null;
+};
+const exactDecimals = (value: number) => {
+  const str = Math.abs(value).toString();
+  const eIndex = str.indexOf("e");
+  if (eIndex === -1) {
+    const dot = str.indexOf(".");
+    return dot === -1 ? 0 : str.length - dot - 1;
+  }
+  const mantissa = str.slice(0, eIndex);
+  const exponent = Number(str.slice(eIndex + 1));
+  const dot = mantissa.indexOf(".");
+  const mantissaDecimals = dot === -1 ? 0 : mantissa.length - dot - 1;
+  return Math.max(0, mantissaDecimals - exponent);
+};
+const decimalsFromIncrement = (
+  increment: number | null | undefined,
+  fallback: number,
+) => {
+  if (!increment || increment <= 0) return fallback;
+  return Math.min(20, exactDecimals(increment));
+};
+const incrementAttr = (value: number | null | undefined, fallback: number) => {
+  const base = value && value > 0 ? value : fallback;
+  return base.toFixed(decimalsFromIncrement(base, 8));
+};
+const priceDecimals = (instrument?: InstrumentInfo) =>
+  instrument?.asset_class === "crypto"
+    ? decimalsFromIncrement(instrument.price_increment, 8)
+    : 2;
+const qtyDecimals = (instrument?: InstrumentInfo) =>
+  instrument?.asset_class === "us_option"
+    ? 0
+    : instrument?.asset_class === "crypto"
+      ? decimalsFromIncrement(instrument.min_trade_increment, 8)
+      : 6;
+const money = (value: number | null | undefined, decimals = 2) =>
   value == null
     ? "--"
-    : `$${value.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+    : `$${value.toLocaleString(undefined, { minimumFractionDigits: Math.min(2, decimals), maximumFractionDigits: decimals })}`;
 const indicatorGroups: { title: string; items: [string, string][] }[] = [
   {
     title: "Moving averages",
@@ -294,7 +339,12 @@ const allIndicatorKeys = indicatorGroups.flatMap((group) =>
 export default function Home() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [feedError, setFeedError] = useState<string | null>(null);
-  const [symbol, setSymbol] = useState("");
+  const [assetMode, setAssetMode] = useState<"equities" | "crypto">("equities");
+  const [equitySymbol, setEquitySymbol] = useState("");
+  const [cryptoSymbol, setCryptoSymbol] = useState("");
+  const symbol = assetMode === "crypto" ? cryptoSymbol : equitySymbol;
+  const setSymbolForMode = (target: "equities" | "crypto", value: string) =>
+    target === "crypto" ? setCryptoSymbol(value) : setEquitySymbol(value);
   const [workspace, setWorkspace] = useState<
     "terminal" | "activity" | "settings"
   >("terminal");
@@ -343,6 +393,8 @@ export default function Home() {
   const [sizingMode, setSizingMode] = useState<"usd" | "quantity">("usd");
   const [orderAmountUsd, setOrderAmountUsd] = useState("5000");
   const [orderQuantity, setOrderQuantity] = useState("1");
+  const [stopPrice, setStopPrice] = useState("");
+  const [timeInForce, setTimeInForce] = useState<"gtc" | "ioc">("gtc");
   const [tpEnabled, setTpEnabled] = useState(true);
   const [tpPct, setTpPct] = useState("5.0");
   const [slEnabled, setSlEnabled] = useState(true);
@@ -366,8 +418,12 @@ export default function Home() {
       const next = JSON.parse(event.data) as Snapshot;
       setSnapshot(next);
       setFeedError(null);
-      if (!symbol) setSymbol(next.symbol);
-
+      if (!symbol || !next.supported_symbols.includes(symbol)) {
+        const match = next.supported_symbols.find(
+          (candidate) => isCryptoTicker(candidate) === (assetMode === "crypto"),
+        );
+        if (match) setSymbolForMode(assetMode, match);
+      }
       setTradingEnabled(next.trading_enabled);
     };
     source.onerror = () => {
@@ -389,7 +445,7 @@ export default function Home() {
       );
     };
     return () => source.close();
-  }, [symbol, chartTimeframe]);
+  }, [symbol, chartTimeframe, assetMode]);
 
   const configurePortfolio = async (enabled?: boolean) => {
     if (!snapshot || configSaving) return;
@@ -405,9 +461,10 @@ export default function Home() {
         };
     const description = changingAutomation
       ? enabled
-        ? `Start Alpaca PAPER automation?
+        ? `Start Alpaca PAPER automation? This is a single global switch shared by both the equities/options and crypto views.
 Options: ${scope?.options_enabled ? scope.option_underlyings.join(", ") : "off"}
 Stock: ${scope?.stock_enabled ? scope.stock_symbol : "off"}
+Crypto: ${scope?.crypto_enabled ? scope.crypto_symbol : "off"}
 Applied budget: ${money(snapshot.settings.capital)}; evaluation: ${snapshot.settings.active_timeframes.join(", ")}
 Market indicators, option candidates and portfolio context will be sent to TypeSafe. Jev may submit orders until paused.`
         : "Pause new automated decisions? Existing orders are not canceled. Protective exits remain active while this feed is running; fills are not guaranteed."
@@ -479,17 +536,39 @@ Automation stays ${tradingEnabled ? "ON; settings take effect immediately" : "PA
 
   const selectedPosition = snapshot?.trading.account.positions[symbol];
   const availableCash = snapshot?.trading.account.available_cash ?? 0;
-  const symbols = snapshot?.supported_symbols ?? [];
+  const symbols = (snapshot?.supported_symbols ?? []).filter(
+    (ticker) => isCryptoTicker(ticker) === (assetMode === "crypto"),
+  );
   const instrument = snapshot?.instruments[symbol];
-  const isOption = instrument?.asset_class === "us_option";
+  const isCrypto = assetMode === "crypto";
+  const isOption = !isCrypto && instrument?.asset_class === "us_option";
   const multiplier = instrument?.multiplier ?? 1;
   const brokerReady = snapshot?.trading.broker_status === "connected";
-  const units = isOption ? "contracts" : "shares";
+  const units = isOption ? "contracts" : isCrypto ? "coins" : "shares";
   const optionsConfig = snapshot?.options;
   const estimateQuantity = (amount: number) =>
     isOption
       ? Math.floor(amount / ((price || 1) * multiplier)).toString()
-      : (amount / (price || 1)).toFixed(6);
+      : (amount / (price || 1)).toFixed(qtyDecimals(instrument));
+  const cryptoPriceIncrement = isCrypto
+    ? (instrument?.price_increment ??
+      (price && price < 1 ? 0.00000001 : price && price < 100 ? 0.0001 : 0.01))
+    : undefined;
+  const chartPriceFormat = cryptoPriceIncrement
+    ? {
+        minMove: cryptoPriceIncrement,
+        precision: decimalsFromIncrement(cryptoPriceIncrement, 8),
+      }
+    : undefined;
+  const cryptoPriceStep = incrementAttr(cryptoPriceIncrement, 0.01);
+  const cryptoQtyStep = incrementAttr(
+    instrument?.min_trade_increment,
+    0.00000001,
+  );
+  const cryptoQtyMin = incrementAttr(
+    instrument?.min_order_size ?? instrument?.min_trade_increment,
+    0.00000001,
+  );
   const toggle = (name: string) =>
     setOverlays((current) =>
       current.includes(name)
@@ -511,6 +590,11 @@ Automation stays ${tradingEnabled ? "ON; settings take effect immediately" : "PA
   ).filter(
     ([, position]) =>
       position.asset_class === "us_option" && position.quantity > 0,
+  );
+  const heldCryptoPositions = Object.entries(
+    snapshot?.trading.account.positions ?? {},
+  ).filter(
+    ([ticker, position]) => isCryptoTicker(ticker) && position.quantity > 0,
   );
   const editablePolicyAvailable =
     optionsConfig &&
@@ -603,14 +687,30 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
   const handleExecuteOrder = async (
     action: "buy" | "sell" | "exit",
     extraParams: Record<string, unknown> = {},
+    immediate = false,
   ) => {
+    const orderLimitPrice = immediate ? "" : limitPrice;
+    const orderStopPrice = immediate ? "" : stopPrice;
+    if (isCrypto && orderStopPrice && !orderLimitPrice) {
+      setFeedback({
+        type: "error",
+        text: "Stop-limit orders require a limit price too.",
+      });
+      return;
+    }
     setOrderLoading(true);
     setFeedback(null);
     try {
       const payload: Record<string, unknown> = {
         action,
         symbol,
-        limit_price: limitPrice ? Number(limitPrice) : undefined,
+        limit_price: orderLimitPrice ? Number(orderLimitPrice) : undefined,
+        ...(isCrypto && !immediate
+          ? { stop_price: orderStopPrice ? Number(orderStopPrice) : undefined }
+          : {}),
+        ...(isCrypto && !immediate
+          ? { time_in_force: orderStopPrice ? "gtc" : timeInForce }
+          : {}),
         ...extraParams,
       };
 
@@ -637,7 +737,7 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
       }
       if (
         !window.confirm(
-          `Submit Alpaca PAPER ${action.toUpperCase()} for ${symbol}? ${JSON.stringify(payload)}. Stocks use market orders unless a limit is set; options use DAY limit orders. Fills are not guaranteed.`,
+          `Submit Alpaca PAPER ${action.toUpperCase()} for ${symbol}? ${JSON.stringify(payload)}. ${isCrypto ? "Crypto trades 24/7 with no margin or short selling; Alpaca charges taker fees up to 0.25%; stop-limit orders are GTC only." : "Stocks use market orders unless a limit is set; options use DAY limit orders."} Fills are not guaranteed.`,
         )
       )
         return;
@@ -739,17 +839,19 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
       });
     }
   };
-  const openOrders = (snapshot?.trading.orders ?? []).filter(
-    (order) =>
-      !["filled", "canceled", "expired", "rejected", "replaced"].includes(
-        order.status ?? "",
-      ),
-  );
-  const positions = Object.entries(
-    snapshot?.trading.account.positions ?? {},
-  ).filter(([, position]) => position.quantity !== 0);
+  const openOrders = (snapshot?.trading.orders ?? [])
+    .filter(
+      (order) =>
+        !["filled", "canceled", "expired", "rejected", "replaced"].includes(
+          order.status ?? "",
+        ),
+    )
+    .filter((order) => isCryptoTicker(order.symbol) === isCrypto);
+  const positions = Object.entries(snapshot?.trading.account.positions ?? {})
+    .filter(([, position]) => position.quantity !== 0)
+    .filter(([ticker]) => isCryptoTicker(ticker) === isCrypto);
   const viewSymbol = (ticker: string) => {
-    setSymbol(ticker);
+    setSymbolForMode(assetMode, ticker);
     setIsEditingTpSl(false);
     setWorkspace("terminal");
   };
@@ -781,16 +883,49 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
           {snapshot?.trading.broker_status ?? "Connecting"}
         </span>
       </header>
+      <div className="mode-bar">
+        <fieldset className="tf-switcher" aria-label="Trading mode">
+          <button
+            type="button"
+            aria-pressed={assetMode === "equities"}
+            className={assetMode === "equities" ? "active" : ""}
+            onClick={() => setAssetMode("equities")}
+          >
+            Equities &amp; options
+          </button>
+          <button
+            type="button"
+            aria-pressed={assetMode === "crypto"}
+            className={assetMode === "crypto" ? "active" : ""}
+            onClick={() => setAssetMode("crypto")}
+          >
+            Crypto
+          </button>
+        </fieldset>
+      </div>
       <section className="scope-bar" aria-label="Active automation scope">
         <div>
-          <span className="scope-label">Options</span>
-          <strong>
-            {scope?.options_enabled
-              ? scope.option_underlyings.join(" · ")
-              : "Off"}
-          </strong>
-          <span className="scope-label">Stock</span>
-          <strong>{scope?.stock_enabled ? scope.stock_symbol : "Off"}</strong>
+          {assetMode === "crypto" ? (
+            <>
+              <span className="scope-label">Crypto</span>
+              <strong>
+                {scope?.crypto_enabled ? scope.crypto_symbol : "Off"}
+              </strong>
+            </>
+          ) : (
+            <>
+              <span className="scope-label">Options</span>
+              <strong>
+                {scope?.options_enabled
+                  ? scope.option_underlyings.join(" · ")
+                  : "Off"}
+              </strong>
+              <span className="scope-label">Stock</span>
+              <strong>
+                {scope?.stock_enabled ? scope.stock_symbol : "Off"}
+              </strong>
+            </>
+          )}
           <button
             className="text-button"
             onClick={() => setWorkspace("settings")}
@@ -807,7 +942,9 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
                 (!brokerReady ||
                   !scope ||
                   !snapshot?.trading.agent_enabled ||
-                  (!scope.stock_enabled && !scope.options_enabled)))
+                  (!scope.stock_enabled &&
+                    !scope.options_enabled &&
+                    !scope.crypto_enabled)))
             }
             onClick={() => void configurePortfolio(!tradingEnabled)}
           >
@@ -829,20 +966,32 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
           label="Available cash"
           value={money(snapshot?.trading.account.available_cash)}
         />
-        <div className="metric">
-          <span className="label">Options exposure · held + reserved</span>
-          <strong>
-            {money(snapshot?.trading.account.options_exposure)}{" "}
-            <span className="metric-secondary">
-              /{" "}
-              {money(
-                optionCapital === null || !optionsConfig
-                  ? null
-                  : optionCapital * optionsConfig.policy.max_total_pct,
-              )}
+        {assetMode === "crypto" ? (
+          <div className="metric">
+            <span className="label">Crypto buying power</span>
+            <strong>
+              {money(snapshot?.trading.account.crypto_buying_power)}
+            </strong>
+            <span className="muted">
+              {snapshot?.trading.account.crypto_status ?? "Not connected"}
             </span>
-          </strong>
-        </div>
+          </div>
+        ) : (
+          <div className="metric">
+            <span className="label">Options exposure · held + reserved</span>
+            <strong>
+              {money(snapshot?.trading.account.options_exposure)}{" "}
+              <span className="metric-secondary">
+                /{" "}
+                {money(
+                  optionCapital === null || !optionsConfig
+                    ? null
+                    : optionCapital * optionsConfig.policy.max_total_pct,
+                )}
+              </span>
+            </strong>
+          </div>
+        )}
         <div className="metric">
           <span className="label">Strategy evaluation</span>
           <strong>
@@ -879,25 +1028,49 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
         </p>
       )}
       <details className="feed-disclosure">
-        <summary>
-          {optionsConfig?.feed === "indicative"
-            ? "Indicative quotes · paper only · not executable NBBO"
-            : "Alpaca paper trading"}
-          <span>Pricing details</span>
-        </summary>
-        <p>
-          {optionsConfig?.feed === "indicative"
-            ? "Quotes are derived; trades are delayed 15 minutes. Spread and depth checks use this indicative feed. Simulated results do not establish live execution quality."
-            : "Paper fills do not establish live execution quality."}{" "}
-          Stock feed: {snapshot?.data_feeds.stocks ?? "unavailable"}. Exits
-          require this feed process, a fresh quote, and an open market; fills
-          are not guaranteed.
-        </p>
+        {assetMode === "crypto" ? (
+          <>
+            <summary>
+              Alpaca crypto paper trading
+              <span>Pricing details</span>
+            </summary>
+            <p>
+              Crypto trades 24/7 with no margin or short selling; Alpaca charges
+              taker fees up to 0.25%. Crypto feed:{" "}
+              {snapshot?.data_feeds.crypto ?? "unavailable"}. Exits require this
+              feed process and a fresh quote; fills are not guaranteed.
+            </p>
+          </>
+        ) : (
+          <>
+            <summary>
+              {optionsConfig?.feed === "indicative"
+                ? "Indicative quotes · paper only · not executable NBBO"
+                : "Alpaca paper trading"}
+              <span>Pricing details</span>
+            </summary>
+            <p>
+              {optionsConfig?.feed === "indicative"
+                ? "Quotes are derived; trades are delayed 15 minutes. Spread and depth checks use this indicative feed. Simulated results do not establish live execution quality."
+                : "Paper fills do not establish live execution quality."}{" "}
+              Stock feed: {snapshot?.data_feeds.stocks ?? "unavailable"}. Exits
+              require this feed process, a fresh quote, and an open market;
+              fills are not guaranteed.
+            </p>
+          </>
+        )}
       </details>
       <div id="workspace-content">
         <div hidden={workspace !== "terminal"} className="terminal-view">
           <div className="terminal-grid">
-            <aside className="watchlist-panel" aria-label="Options watchlist">
+            <aside
+              className="watchlist-panel"
+              aria-label={
+                assetMode === "crypto"
+                  ? "Crypto watchlist"
+                  : "Options watchlist"
+              }
+            >
               <div className="panel-head">
                 <h2>Watchlist</h2>
                 <button
@@ -907,121 +1080,179 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
                   Edit watchlist
                 </button>
               </div>
-              <p className="help-text">
-                Options underlyings ·{" "}
-                {scope?.options_enabled ? "enabled" : "automation off"}
-              </p>
-              {optionsConfig?.underlyings.length ? (
-                optionsConfig.underlyings.map((underlying) => {
-                  const scan = snapshot?.trading.option_scans?.[underlying];
-                  return (
-                    <div
-                      className={
-                        symbol === underlying
-                          ? "watchlist-row selected"
-                          : "watchlist-row"
-                      }
-                      key={underlying}
-                    >
+              {assetMode === "crypto" ? (
+                <>
+                  <p className="help-text">
+                    Crypto pairs ·{" "}
+                    {scope?.crypto_enabled ? "enabled" : "automation off"}
+                  </p>
+                  {scope?.crypto_symbols.length ? (
+                    scope.crypto_symbols.map((ticker) => (
                       <button
+                        key={ticker}
                         className="ticker-button"
-                        onClick={() => viewSymbol(underlying)}
+                        onClick={() => viewSymbol(ticker)}
                       >
-                        <strong>{underlying}</strong>
-                        <span
-                          className={
-                            scan?.status === "scanning"
-                              ? "scan-updating"
-                              : "muted"
-                          }
-                        >
-                          {scan?.status === "scanning"
-                            ? "Updating"
-                            : (scan?.status ?? "Awaiting scan")}
+                        <strong>{ticker}</strong>
+                        <span className="muted">
+                          {scope.crypto_enabled &&
+                          scope.crypto_symbol === ticker
+                            ? "Active strategy"
+                            : "24/7 · View chart"}
                         </span>
                       </button>
-                      <details>
-                        <summary>
-                          {scan?.eligible != null
-                            ? `${scan.eligible} eligible / ${scan.discovered ?? 0} found`
-                            : "Awaiting first completed scan"}
-                        </summary>
-                        {scan?.as_of && (
-                          <p className="help-text">
-                            Last result{" "}
-                            {new Date(scan.as_of * 1000).toLocaleTimeString()}
-                          </p>
-                        )}
-                        {scan?.reason && (
-                          <p className="help-text">{scan.reason}</p>
-                        )}
-                        {scan?.error && (
-                          <p className="negative">{scan.error}</p>
-                        )}
-                        {scan?.candidates?.map((candidate) => (
-                          <button
-                            className="contract-link"
-                            key={candidate.symbol}
-                            onClick={() => viewSymbol(candidate.symbol)}
-                          >
-                            <strong>
-                              {candidate.option_type} · {candidate.strike}
-                            </strong>
-                            <span>
-                              {candidate.expiration} ·{" "}
-                              {money(candidate.limit_price)} premium
-                            </span>
-                            <small>
-                              {candidate.open_interest} OI ·{" "}
-                              {(candidate.spread_pct * 100).toFixed(1)}% spread
-                              · up to {candidate.max_quantity} ct
-                            </small>
-                          </button>
-                        ))}
-                      </details>
+                    ))
+                  ) : (
+                    <div className="empty-state">
+                      Add crypto pairs in Settings to build your watchlist.
                     </div>
-                  );
-                })
+                  )}
+                  {!!heldCryptoPositions.length && (
+                    <div className="stock-watchlist">
+                      <h3>Held crypto</h3>
+                      {heldCryptoPositions.map(([ticker, position]) => (
+                        <button
+                          className="contract-link"
+                          key={ticker}
+                          onClick={() => viewSymbol(ticker)}
+                        >
+                          <strong>{ticker}</strong>
+                          <span>
+                            {position.quantity.toLocaleString(undefined, {
+                              maximumFractionDigits: qtyDecimals(
+                                snapshot?.instruments[ticker],
+                              ),
+                            })}{" "}
+                            coins
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </>
               ) : (
-                <div className="empty-state">
-                  Add options underlyings in Settings to build your watchlist.
-                </div>
-              )}
-              {!!scope?.stock_symbols.length && (
-                <div className="stock-watchlist">
-                  <h3>Stock watchlist</h3>
-                  {scope.stock_symbols.map((ticker) => (
-                    <button
-                      key={ticker}
-                      className="ticker-button"
-                      onClick={() => viewSymbol(ticker)}
-                    >
-                      <strong>{ticker}</strong>
-                      <span className="muted">
-                        {scope.stock_enabled && scope.stock_symbol === ticker
-                          ? "Active strategy"
-                          : "View chart"}
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              )}
-              {!!heldOptionPositions.length && (
-                <div className="stock-watchlist">
-                  <h3>Held options</h3>
-                  {heldOptionPositions.map(([ticker, position]) => (
-                    <button
-                      className="contract-link"
-                      key={ticker}
-                      onClick={() => viewSymbol(ticker)}
-                    >
-                      <strong>
-                        {position.underlying} · {position.quantity} ct
-                      </strong>
-                      <span>{ticker}</span>
-                    </button>
-                  ))}
-                </div>
+                <>
+                  <p className="help-text">
+                    Options underlyings ·{" "}
+                    {scope?.options_enabled ? "enabled" : "automation off"}
+                  </p>
+                  {optionsConfig?.underlyings.length ? (
+                    optionsConfig.underlyings.map((underlying) => {
+                      const scan = snapshot?.trading.option_scans?.[underlying];
+                      return (
+                        <div
+                          className={
+                            symbol === underlying
+                              ? "watchlist-row selected"
+                              : "watchlist-row"
+                          }
+                          key={underlying}
+                        >
+                          <button
+                            className="ticker-button"
+                            onClick={() => viewSymbol(underlying)}
+                          >
+                            <strong>{underlying}</strong>
+                            <span
+                              className={
+                                scan?.status === "scanning"
+                                  ? "scan-updating"
+                                  : "muted"
+                              }
+                            >
+                              {scan?.status === "scanning"
+                                ? "Updating"
+                                : (scan?.status ?? "Awaiting scan")}
+                            </span>
+                          </button>
+                          <details>
+                            <summary>
+                              {scan?.eligible != null
+                                ? `${scan.eligible} eligible / ${scan.discovered ?? 0} found`
+                                : "Awaiting first completed scan"}
+                            </summary>
+                            {scan?.as_of && (
+                              <p className="help-text">
+                                Last result{" "}
+                                {new Date(
+                                  scan.as_of * 1000,
+                                ).toLocaleTimeString()}
+                              </p>
+                            )}
+                            {scan?.reason && (
+                              <p className="help-text">{scan.reason}</p>
+                            )}
+                            {scan?.error && (
+                              <p className="negative">{scan.error}</p>
+                            )}
+                            {scan?.candidates?.map((candidate) => (
+                              <button
+                                className="contract-link"
+                                key={candidate.symbol}
+                                onClick={() => viewSymbol(candidate.symbol)}
+                              >
+                                <strong>
+                                  {candidate.option_type} · {candidate.strike}
+                                </strong>
+                                <span>
+                                  {candidate.expiration} ·{" "}
+                                  {money(candidate.limit_price)} premium
+                                </span>
+                                <small>
+                                  {candidate.open_interest} OI ·{" "}
+                                  {(candidate.spread_pct * 100).toFixed(1)}%
+                                  spread · up to {candidate.max_quantity} ct
+                                </small>
+                              </button>
+                            ))}
+                          </details>
+                        </div>
+                      );
+                    })
+                  ) : (
+                    <div className="empty-state">
+                      Add options underlyings in Settings to build your
+                      watchlist.
+                    </div>
+                  )}
+                  {!!scope?.stock_symbols.length && (
+                    <div className="stock-watchlist">
+                      <h3>Stock watchlist</h3>
+                      {scope.stock_symbols.map((ticker) => (
+                        <button
+                          key={ticker}
+                          className="ticker-button"
+                          onClick={() => viewSymbol(ticker)}
+                        >
+                          <strong>{ticker}</strong>
+                          <span className="muted">
+                            {scope.stock_enabled &&
+                            scope.stock_symbol === ticker
+                              ? "Active strategy"
+                              : "View chart"}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {!!heldOptionPositions.length && (
+                    <div className="stock-watchlist">
+                      <h3>Held options</h3>
+                      {heldOptionPositions.map(([ticker, position]) => (
+                        <button
+                          className="contract-link"
+                          key={ticker}
+                          onClick={() => viewSymbol(ticker)}
+                        >
+                          <strong>
+                            {position.underlying} · {position.quantity} ct
+                          </strong>
+                          <span>{ticker}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </>
               )}
             </aside>
             <section className="chart-panel" aria-label="Price chart">
@@ -1047,7 +1278,7 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
                   </span>
                 </div>
                 <div className="quote">
-                  <strong>{money(price)}</strong>
+                  <strong>{money(price, priceDecimals(instrument))}</strong>
                   <span
                     className={
                       change != null && change >= 0 ? "positive" : "muted"
@@ -1121,6 +1352,7 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
                   indicatorSeries={snapshot.indicator_series}
                   overlays={overlays}
                   position={selectedPosition}
+                  priceFormat={chartPriceFormat}
                 />
               ) : (
                 <div className="loading">
@@ -1135,7 +1367,12 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
                     <span>{labelFor(key)}</span>
                     <strong>
                       {symbolReady && snapshot?.indicators[key] != null
-                        ? snapshot.indicators[key].toFixed(2)
+                        ? snapshot.indicators[key].toLocaleString(undefined, {
+                            maximumFractionDigits:
+                              isCrypto && Math.abs(snapshot.indicators[key]) < 1
+                                ? Math.max(2, priceDecimals(instrument))
+                                : 2,
+                          })
                         : "Warming up"}
                     </strong>
                   </div>
@@ -1159,7 +1396,13 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
               </div>
               <p className="trade-symbol">
                 {symbol || "Select an instrument"}
-                <span>{isOption ? "Long options only" : "Stocks"}</span>
+                <span>
+                  {isOption
+                    ? "Long options only"
+                    : isCrypto
+                      ? "Crypto · 24/7"
+                      : "Stocks"}
+                </span>
               </p>
               <div className="manual-order-panel">
                 <div className="side-selector">
@@ -1181,8 +1424,8 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
                   Limit price / premium (optional)
                   <input
                     type="number"
-                    min="0.01"
-                    step="0.01"
+                    min={isCrypto ? cryptoPriceStep : "0.01"}
+                    step={isCrypto ? cryptoPriceStep : "0.01"}
                     value={limitPrice}
                     onChange={(e) => setLimitPrice(e.target.value)}
                     placeholder={
@@ -1190,10 +1433,40 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
                     }
                   />
                 </label>
+                {isCrypto && (
+                  <label className="order-field-row">
+                    Stop price (optional · stop-limit)
+                    <input
+                      type="number"
+                      min={cryptoPriceStep}
+                      step={cryptoPriceStep}
+                      value={stopPrice}
+                      onChange={(e) => setStopPrice(e.target.value)}
+                      placeholder="Requires a limit price too"
+                    />
+                  </label>
+                )}
+                {isCrypto && (
+                  <label className="order-field-row">
+                    Time in force
+                    <select
+                      value={stopPrice ? "gtc" : timeInForce}
+                      disabled={!!stopPrice}
+                      onChange={(e) =>
+                        setTimeInForce(e.target.value as "gtc" | "ioc")
+                      }
+                    >
+                      <option value="gtc">GTC — good till canceled</option>
+                      <option value="ioc">IOC — immediate or cancel</option>
+                    </select>
+                  </label>
+                )}
                 <p className="size-hint">
                   {isOption
                     ? `Whole contracts; multiplier ${multiplier}. Buy to open / sell to close only.`
-                    : "Shares; fractional quantities require a fractionable asset."}
+                    : isCrypto
+                      ? "Market orders seek immediate execution; fills are not guaranteed. Add a limit price to constrain fill price, or a stop price for a stop-limit order (GTC only)."
+                      : "Shares; fractional quantities require a fractionable asset."}
                 </p>
 
                 {/* Sizing Mode Switch */}
@@ -1242,12 +1515,16 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
                   ) : (
                     <div className="input-group">
                       <span className="input-prefix">
-                        {symbol.split("-")[0]}
+                        {isCrypto ? symbol.split("/")[0] : symbol.split("-")[0]}
                       </span>
                       <input
                         type="number"
-                        min={isOption ? "1" : "0.000001"}
-                        step={isOption ? "1" : "0.000001"}
+                        min={
+                          isOption ? "1" : isCrypto ? cryptoQtyMin : "0.000001"
+                        }
+                        step={
+                          isOption ? "1" : isCrypto ? cryptoQtyStep : "0.000001"
+                        }
                         value={orderQuantity}
                         onChange={(e) => {
                           const val = e.target.value;
@@ -1334,10 +1611,10 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
                         </label>
                         {tpEnabled && price ? (
                           <span className="target-calc text-accent">
-                            Target: $
-                            {(price * (1 + Number(tpPct) / 100)).toLocaleString(
-                              undefined,
-                              { maximumFractionDigits: 2 },
+                            Target:{" "}
+                            {money(
+                              price * (1 + Number(tpPct) / 100),
+                              priceDecimals(instrument),
                             )}
                           </span>
                         ) : null}
@@ -1383,10 +1660,10 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
                         </label>
                         {slEnabled && price ? (
                           <span className="target-calc text-coral">
-                            Target: $
-                            {(price * (1 - Number(slPct) / 100)).toLocaleString(
-                              undefined,
-                              { maximumFractionDigits: 2 },
+                            Target:{" "}
+                            {money(
+                              price * (1 - Number(slPct) / 100),
+                              priceDecimals(instrument),
                             )}
                           </span>
                         ) : null}
@@ -1486,37 +1763,49 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
                     </tr>
                   </thead>
                   <tbody>
-                    {positions.map(([ticker, position]) => (
-                      <tr key={ticker}>
-                        <td>
-                          <strong>{ticker}</strong>
-                          {position.expiration && (
-                            <small>Expires {position.expiration}</small>
-                          )}
-                        </td>
-                        <td>{position.quantity}</td>
-                        <td>{money(position.average_entry_price)}</td>
-                        <td>{money(position.market_value)}</td>
-                        <td
-                          className={
-                            position.unrealized_pnl >= 0
-                              ? "positive"
-                              : "negative"
-                          }
-                        >
-                          {money(position.unrealized_pnl)}
-                        </td>
-                        <td>
-                          {position.exit_reason ||
-                            `TP ${money(position.take_profit_price)} / SL ${money(position.stop_loss_price)}`}
-                        </td>
-                        <td>
-                          <button onClick={() => viewSymbol(ticker)}>
-                            View / manage
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
+                    {positions.map(([ticker, position]) => {
+                      const rowInstrument = snapshot?.instruments[ticker];
+                      return (
+                        <tr key={ticker}>
+                          <td>
+                            <strong>{ticker}</strong>
+                            {position.expiration && (
+                              <small>Expires {position.expiration}</small>
+                            )}
+                          </td>
+                          <td>
+                            {position.quantity.toLocaleString(undefined, {
+                              maximumFractionDigits: qtyDecimals(rowInstrument),
+                            })}
+                          </td>
+                          <td>
+                            {money(
+                              position.average_entry_price,
+                              priceDecimals(rowInstrument),
+                            )}
+                          </td>
+                          <td>{money(position.market_value)}</td>
+                          <td
+                            className={
+                              position.unrealized_pnl >= 0
+                                ? "positive"
+                                : "negative"
+                            }
+                          >
+                            {money(position.unrealized_pnl)}
+                          </td>
+                          <td>
+                            {position.exit_reason ||
+                              `TP ${money(position.take_profit_price, priceDecimals(rowInstrument))} / SL ${money(position.stop_loss_price, priceDecimals(rowInstrument))}`}
+                          </td>
+                          <td>
+                            <button onClick={() => viewSymbol(ticker)}>
+                              View / manage
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
                 {!positions.length && (
@@ -1552,13 +1841,9 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
                     <div className="pos-metric">
                       <span className="pos-label">Entry:</span>
                       <strong>
-                        $
-                        {selectedPosition.average_entry_price.toLocaleString(
-                          undefined,
-                          {
-                            minimumFractionDigits: 2,
-                            maximumFractionDigits: 2,
-                          },
+                        {money(
+                          selectedPosition.average_entry_price,
+                          priceDecimals(instrument),
                         )}
                       </strong>
                     </div>
@@ -1566,7 +1851,7 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
                       <span className="pos-label">Size:</span>
                       <strong>
                         {selectedPosition.quantity.toLocaleString(undefined, {
-                          maximumFractionDigits: isOption ? 0 : 6,
+                          maximumFractionDigits: qtyDecimals(instrument),
                         })}
                       </strong>
                     </div>
@@ -1574,7 +1859,7 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
                       <span className="pos-label">Take profit:</span>
                       <strong className="text-accent">
                         {selectedPosition.take_profit_price
-                          ? `$${selectedPosition.take_profit_price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} (+${selectedPosition.take_profit_pct?.toFixed(2)}%)`
+                          ? `${money(selectedPosition.take_profit_price, priceDecimals(instrument))} (+${selectedPosition.take_profit_pct?.toFixed(2)}%)`
                           : "None"}
                       </strong>
                     </div>
@@ -1582,7 +1867,7 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
                       <span className="pos-label">Stop loss:</span>
                       <strong className="text-coral">
                         {selectedPosition.stop_loss_price
-                          ? `$${selectedPosition.stop_loss_price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} (-${selectedPosition.stop_loss_pct?.toFixed(2)}%)`
+                          ? `${money(selectedPosition.stop_loss_price, priceDecimals(instrument))} (-${selectedPosition.stop_loss_pct?.toFixed(2)}%)`
                           : "None"}
                       </strong>
                     </div>
@@ -1648,7 +1933,7 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
                     <div className="pos-card-actions">
                       <button
                         className="exit-btn danger"
-                        onClick={() => handleExecuteOrder("exit")}
+                        onClick={() => handleExecuteOrder("exit", {}, true)}
                         disabled={orderLoading || !brokerReady}
                         title="Submit a paper order to exit this position; execution is not guaranteed"
                       >
@@ -1657,7 +1942,11 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
                       <button
                         className="exit-btn secondary"
                         onClick={() =>
-                          handleExecuteOrder("sell", { pct_of_position: 0.5 })
+                          handleExecuteOrder(
+                            "sell",
+                            { pct_of_position: 0.5 },
+                            true,
+                          )
                         }
                         disabled={
                           orderLoading ||
@@ -1700,11 +1989,25 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
                       </span>
                     </div>
                     <span>
-                      {order.filled_qty ?? 0} / {order.quantity} filled
+                      {(order.filled_qty ?? 0).toLocaleString(undefined, {
+                        maximumFractionDigits: qtyDecimals(
+                          snapshot?.instruments[order.symbol],
+                        ),
+                      })}{" "}
+                      /{" "}
+                      {order.quantity.toLocaleString(undefined, {
+                        maximumFractionDigits: qtyDecimals(
+                          snapshot?.instruments[order.symbol],
+                        ),
+                      })}{" "}
+                      filled
                     </span>
                     <span>
                       {order.price != null
-                        ? money(order.price)
+                        ? money(
+                            order.price,
+                            priceDecimals(snapshot?.instruments[order.symbol]),
+                          )
                         : "Awaiting fill"}
                     </span>
                     {order.id && (
@@ -1731,6 +2034,14 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
                 snapshot.trading.agent_log
                   .slice()
                   .reverse()
+                  .filter((event) => {
+                    const eventTicker =
+                      event.symbol ??
+                      (typeof event.request?.symbol === "string"
+                        ? event.request.symbol
+                        : "");
+                    return isCryptoTicker(eventTicker) === isCrypto;
+                  })
                   .map((event, index) => {
                     const ticker =
                       event.symbol ??
@@ -1779,10 +2090,23 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
                           {event.trade && (
                             <p>
                               {event.trade.symbol} · {event.trade.side} ·{" "}
-                              {event.trade.filled_qty ?? 0} /{" "}
-                              {event.trade.quantity} filled
+                              {(event.trade.filled_qty ?? 0).toLocaleString(
+                                undefined,
+                                {
+                                  maximumFractionDigits: qtyDecimals(
+                                    snapshot?.instruments[event.trade.symbol],
+                                  ),
+                                },
+                              )}{" "}
+                              /{" "}
+                              {event.trade.quantity.toLocaleString(undefined, {
+                                maximumFractionDigits: qtyDecimals(
+                                  snapshot?.instruments[event.trade.symbol],
+                                ),
+                              })}{" "}
+                              filled
                               {event.trade.price != null
-                                ? ` at ${money(event.trade.price)}`
+                                ? ` at ${money(event.trade.price, priceDecimals(snapshot?.instruments[event.trade.symbol]))}`
                                 : ""}
                             </p>
                           )}
@@ -1829,22 +2153,39 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
                   </tr>
                 </thead>
                 <tbody>
-                  {snapshot?.trading.positions.map((trade, index) => (
-                    <tr key={trade.id ?? index}>
-                      <td>{trade.symbol}</td>
-                      <td>{trade.side}</td>
-                      <td>{trade.quantity}</td>
-                      <td>{money(trade.price)}</td>
-                      <td>{trade.status}</td>
-                      <td>{trade.reason ?? "Alpaca"}</td>
-                      <td>
-                        {new Date(trade.timestamp * 1000).toLocaleString()}
-                      </td>
-                    </tr>
-                  ))}
+                  {(snapshot?.trading.positions ?? [])
+                    .filter(
+                      (trade) => isCryptoTicker(trade.symbol) === isCrypto,
+                    )
+                    .map((trade, index) => (
+                      <tr key={trade.id ?? index}>
+                        <td>{trade.symbol}</td>
+                        <td>{trade.side}</td>
+                        <td>
+                          {trade.quantity.toLocaleString(undefined, {
+                            maximumFractionDigits: qtyDecimals(
+                              snapshot?.instruments[trade.symbol],
+                            ),
+                          })}
+                        </td>
+                        <td>
+                          {money(
+                            trade.price,
+                            priceDecimals(snapshot?.instruments[trade.symbol]),
+                          )}
+                        </td>
+                        <td>{trade.status}</td>
+                        <td>{trade.reason ?? "Alpaca"}</td>
+                        <td>
+                          {new Date(trade.timestamp * 1000).toLocaleString()}
+                        </td>
+                      </tr>
+                    ))}
                 </tbody>
               </table>
-              {!snapshot?.trading.positions.length && (
+              {!(snapshot?.trading.positions ?? []).filter(
+                (trade) => isCryptoTicker(trade.symbol) === isCrypto,
+              ).length && (
                 <p className="empty-state">
                   No confirmed fills yet. Broker acknowledgements are not fills.
                 </p>
@@ -1860,14 +2201,18 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
           <div className="view-heading">
             <h1>Settings</h1>
             <p className="muted">
-              Set the scope. Define the limits. Keep execution deliberate.
+              {assetMode === "crypto"
+                ? "Set the crypto scope. Global budget and limits apply account-wide."
+                : "Set the scope. Define the limits. Keep execution deliberate."}
             </p>
           </div>
           {scope ? (
             <ScopeEditor
+              key={assetMode}
               saved={scope}
               running={tradingEnabled}
               feedBase={feedBase}
+              mode={assetMode}
               onSaved={(saved) =>
                 setSnapshot((current) =>
                   current
@@ -1955,22 +2300,24 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
                       }
                     />
                   </label>
-                  <label className="field">
-                    Stock risk
-                    <select
-                      value={riskAppetite}
-                      onChange={(event) =>
-                        setGeneralDraft((d) => ({
-                          ...d,
-                          risk: event.target.value,
-                        }))
-                      }
-                    >
-                      <option value="conservative">Conservative</option>
-                      <option value="balanced">Balanced</option>
-                      <option value="aggressive">Aggressive</option>
-                    </select>
-                  </label>
+                  {assetMode === "equities" && (
+                    <label className="field">
+                      Stock risk
+                      <select
+                        value={riskAppetite}
+                        onChange={(event) =>
+                          setGeneralDraft((d) => ({
+                            ...d,
+                            risk: event.target.value,
+                          }))
+                        }
+                      >
+                        <option value="conservative">Conservative</option>
+                        <option value="balanced">Balanced</option>
+                        <option value="aggressive">Aggressive</option>
+                      </select>
+                    </label>
+                  )}
                 </div>
                 <fieldset className="interval-options">
                   <legend>Strategy evaluation intervals</legend>
@@ -2047,7 +2394,7 @@ Automation stays ${tradingEnabled ? "ON; new orders may use these limits immedia
             </form>
           </section>
 
-          {optionsConfig && (
+          {assetMode === "equities" && optionsConfig && (
             <>
               {" "}
               {!editablePolicyAvailable ? (

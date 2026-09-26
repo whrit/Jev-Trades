@@ -1,7 +1,8 @@
-"""Poll Alpaca stock/option data and publish the dashboard SSE feed."""
+"""Alpaca stock/options polling and live crypto data for the dashboard SSE feed."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
@@ -12,13 +13,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
+from urllib.parse import quote as encode_symbol
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 from alpaca.common.enums import Sort
-from alpaca.data.historical import OptionHistoricalDataClient, StockHistoricalDataClient
+from alpaca.data.historical import (
+    CryptoHistoricalDataClient,
+    OptionHistoricalDataClient,
+    StockHistoricalDataClient,
+)
+from alpaca.data.live import CryptoDataStream
 from alpaca.data.models import BarSet
 from alpaca.data.requests import (
+    CryptoBarsRequest,
+    CryptoLatestQuoteRequest,
     OptionBarsRequest,
     OptionLatestQuoteRequest,
     StockBarsRequest,
@@ -30,11 +39,11 @@ from pydantic import ValidationError
 if __package__:
     from . import config
     from .api_models import CONFIG_PAYLOAD, ORDER_PAYLOAD
-    from .paper_trader import PaperTrader
+    from .paper_trader import TERMINAL, PaperTrader
 else:
     import config
     from api_models import CONFIG_PAYLOAD, ORDER_PAYLOAD
-    from paper_trader import PaperTrader
+    from paper_trader import TERMINAL, PaperTrader
 
 
 TIMEFRAMES = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
@@ -57,6 +66,7 @@ class MarketState:
         self.max_wallet_position_pct = 0.75
         self.risk_appetite = "balanced"
         self.active_timeframes = ["1m"]
+        self.crypto_stream_error: str | None = None
         self.chart_timeframe = "1m"
 
     def snapshot(self, symbol: str | None = None, timeframe: str | None = None) -> dict[str, Any]:
@@ -86,7 +96,13 @@ class MarketState:
                 "supported_symbols": supported,
                 "trading_scope": TRADER.scope.model_dump(mode="json"),
                 "instruments": {
-                    s: TRADER.instruments.get(s, {"asset_class": "us_equity", "multiplier": 1})
+                    s: TRADER.instruments.get(
+                        s,
+                        {
+                            "asset_class": "crypto" if TRADER.is_crypto(s) else "us_equity",
+                            "multiplier": 1,
+                        },
+                    )
                     for s in supported
                 },
                 "options": {
@@ -97,7 +113,9 @@ class MarketState:
                 "data_feeds": {
                     "stocks": config.STOCK_FEED.value,
                     "options": config.OPTION_FEED.value,
+                    "crypto": config.CRYPTO_FEED.value,
                 },
+                "crypto_stream_error": self.crypto_stream_error,
                 "status": market["status"],
                 "error": market["error"],
                 "server_time": int(time.time()),
@@ -127,7 +145,7 @@ def _series(bars: list[dict[str, Any]], key: str) -> pd.Series:
 
 
 def _last(value: Any) -> float | None:
-    return None if not math.isfinite(float(value)) else round(float(value), 6)
+    return None if not math.isfinite(float(value)) else float(value)
 
 
 def _wilder(series: pd.Series, period: int) -> pd.Series:
@@ -301,6 +319,19 @@ def merge_bars(symbol: str, incoming: list[Any]) -> None:
             timestamp = int(bar.timestamp.timestamp())
             if timestamp + 60 > time.time():
                 continue
+            if (
+                not all(
+                    math.isfinite(value)
+                    for value in (bar.open, bar.high, bar.low, bar.close, bar.volume)
+                )
+                or not 0
+                < bar.low
+                <= min(bar.open, bar.close)
+                <= max(bar.open, bar.close)
+                <= bar.high
+                or bar.volume < 0
+            ):
+                raise ValueError("Invalid provider OHLCV bar")
             merged[timestamp] = {
                 "time": timestamp,
                 "open": bar.open,
@@ -312,7 +343,7 @@ def merge_bars(symbol: str, incoming: list[Any]) -> None:
         market["bars"] = [merged[t] for t in sorted(merged)[-MAX_BARS:]]
         latest = market["bars"][-1]["time"] if market["bars"] else None
         STORE_DIR.mkdir(parents=True, exist_ok=True)
-        path = STORE_DIR / f"{symbol}.json"
+        path = STORE_DIR / f"{encode_symbol(symbol, safe='')}.json"
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps(market["bars"]), encoding="utf-8")
         temporary.replace(path)
@@ -325,6 +356,7 @@ def merge_bars(symbol: str, incoming: list[Any]) -> None:
                     state = build_agent_state(symbol, tf)
                     TRADER.submit(state, strategy="options")
                     TRADER.submit(state, strategy="stock")
+                    TRADER.submit(state, strategy="crypto")
 
 
 def build_agent_state(symbol: str, timeframe: str = "1m") -> dict[str, Any]:
@@ -343,7 +375,7 @@ def build_agent_state(symbol: str, timeframe: str = "1m") -> dict[str, Any]:
         if price is None:
             return {}
         day_start = (
-            datetime.now(ZoneInfo("America/New_York"))
+            datetime.now(timezone.utc if TRADER.is_crypto(symbol) else ZoneInfo("America/New_York"))
             .replace(hour=0, minute=0, second=0, microsecond=0)
             .timestamp()
         )
@@ -357,7 +389,11 @@ def build_agent_state(symbol: str, timeframe: str = "1m") -> dict[str, Any]:
         position = trading["positions"].get(symbol, {})
         return {
             "symbol": symbol,
-            "asset_class": "us_option" if TRADER.is_option(symbol) else "us_equity",
+            "asset_class": "us_option"
+            if TRADER.is_option(symbol)
+            else "crypto"
+            if TRADER.is_crypto(symbol)
+            else "us_equity",
             "contract_multiplier": TRADER.instruments.get(symbol, {}).get(
                 "multiplier", 100 if TRADER.is_option(symbol) else 1
             ),
@@ -435,11 +471,68 @@ def build_agent_state(symbol: str, timeframe: str = "1m") -> dict[str, Any]:
         }
 
 
+def update_quote(symbol: str, quote: Any) -> None:
+    timestamp = quote.timestamp.timestamp()
+    bid, ask = float(quote.bid_price), float(quote.ask_price)
+    if not (math.isfinite(bid) and math.isfinite(ask) and 0 < bid <= ask):
+        raise ValueError("Invalid or crossed market quote")
+    age = time.time() - timestamp
+    if age < -5:
+        raise ValueError("Market quote timestamp is in the future")
+    fresh = age <= 30
+    with STATE.lock:
+        market = STATE.markets.setdefault(symbol, {"bars": [], "last_tick": None})
+        if market["last_tick"] is not None and timestamp < market["last_tick"]:
+            return
+        market.update(
+            price=(bid + ask) / 2,
+            last_tick=timestamp,
+            status="live" if fresh else "stale quote",
+            error=None,
+        )
+    if fresh and not TRADER.is_option(symbol):
+        try:
+            TRADER.check_tp_sl(symbol, bid)
+        except Exception as error:
+            with STATE.lock:
+                market["error"] = f"Exit monitoring: {error}"
+
+
+async def crypto_quote(quote: Any) -> None:
+    try:
+        await asyncio.to_thread(update_quote, quote.symbol, quote)
+        with STATE.lock:
+            STATE.crypto_stream_error = None
+    except Exception as error:
+        with STATE.lock:
+            STATE.crypto_stream_error = str(error)
+
+
+async def crypto_bar(bar: Any) -> None:
+    try:
+        with STATE.lock:
+            STATE.markets.setdefault(
+                bar.symbol,
+                {"bars": [], "price": None, "last_tick": None, "status": "starting", "error": None},
+            )
+        await asyncio.to_thread(merge_bars, bar.symbol, [bar])
+    except Exception as error:
+        with STATE.lock:
+            STATE.crypto_stream_error = str(error)
+
+
 def market_worker() -> None:
     clients = None
     last_history: dict[str, float] = {}
+    key, secret = os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_SECRET_KEY")
+    crypto = (
+        CryptoHistoricalDataClient(key, secret) if key and secret else CryptoHistoricalDataClient()
+    )
+    stream: CryptoDataStream | None = None
+    stream_thread: threading.Thread | None = None
+    subscribed: set[str] = set()
     for symbol in TRADER.symbols():
-        path = STORE_DIR / f"{symbol}.json"
+        path = STORE_DIR / f"{encode_symbol(symbol, safe='')}.json"
         if path.exists():
             try:
                 with STATE.lock:
@@ -461,11 +554,49 @@ def market_worker() -> None:
                     [
                         *TRADER.scope.stock_symbols,
                         *TRADER.scope.option_underlyings,
+                        *TRADER.scope.crypto_symbols,
+                        *(
+                            o["symbol"]
+                            for o in TRADER.orders.values()
+                            if o["status"] not in TERMINAL
+                        ),
                         *TRADER.positions,
                         *TRADER.chart_requests,
                     ]
                 )
             )
+        desired = {s for s in watched if TRADER.is_crypto(s)}
+        try:
+            if desired and (stream_thread is None or not stream_thread.is_alive()):
+                key, secret = config.credentials()
+                stream = CryptoDataStream(key, secret, feed=config.CRYPTO_FEED, data_timeout=30)
+                stream.subscribe_quotes(crypto_quote, *sorted(desired))
+                stream.subscribe_bars(crypto_bar, *sorted(desired))
+                stream.subscribe_updated_bars(crypto_bar, *sorted(desired))
+                subscribed = desired
+                stream_thread = threading.Thread(
+                    target=stream.run, daemon=True, name="alpaca-crypto-stream"
+                )
+                stream_thread.start()
+            elif stream is not None:
+                added, removed = desired - subscribed, subscribed - desired
+                if added:
+                    stream.subscribe_quotes(crypto_quote, *sorted(added))
+                    stream.subscribe_bars(crypto_bar, *sorted(added))
+                    stream.subscribe_updated_bars(crypto_bar, *sorted(added))
+                if removed:
+                    stream.unsubscribe_quotes(*sorted(removed))
+                    stream.unsubscribe_bars(*sorted(removed))
+                    stream.unsubscribe_updated_bars(*sorted(removed))
+                subscribed = desired
+                if not desired:
+                    stream.stop()
+                    if stream_thread is not None:
+                        stream_thread.join(timeout=5)
+        except Exception as error:
+            with STATE.lock:
+                STATE.crypto_stream_error = str(error)
+
         for symbol in watched:
             try:
                 with STATE.lock:
@@ -479,41 +610,32 @@ def market_worker() -> None:
                             "error": None,
                         },
                     )
-                if clients is None:
+                if clients is None and not TRADER.is_crypto(symbol):
                     key, secret = config.credentials()
                     clients = (
                         StockHistoricalDataClient(key, secret),
                         OptionHistoricalDataClient(key, secret),
                     )
-                stock, option = clients
                 is_option = TRADER.is_option(symbol)
-                if is_option:
+                is_crypto = TRADER.is_crypto(symbol)
+                stock, option = clients if clients is not None else (None, None)
+                if is_crypto:
+                    quotes = crypto.get_crypto_latest_quote(
+                        CryptoLatestQuoteRequest(symbol_or_symbols=symbol), feed=config.CRYPTO_FEED
+                    )
+                elif is_option and option is not None:
                     quotes = option.get_option_latest_quote(
                         OptionLatestQuoteRequest(symbol_or_symbols=symbol, feed=config.OPTION_FEED)
                     )
-                else:
+                elif stock is not None:
                     quotes = stock.get_stock_latest_quote(
                         StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=config.STOCK_FEED)
                     )
+                else:
+                    raise ValueError("Market data client is unavailable")
                 quote = quotes.get(symbol)
                 if quote is not None:
-                    age = time.time() - quote.timestamp.timestamp()
-                    price = (quote.bid_price + quote.ask_price) / 2
-                    if math.isfinite(price) and 0 < quote.bid_price <= quote.ask_price:
-                        with STATE.lock:
-                            market = STATE.markets[symbol]
-                            market.update(
-                                price=price,
-                                last_tick=quote.timestamp.timestamp(),
-                                status="live" if -5 <= age <= 30 else "stale / market closed",
-                                error=None,
-                            )
-                        if -5 <= age <= 30 and not is_option:
-                            try:
-                                TRADER.check_tp_sl(symbol, quote.bid_price)
-                            except Exception as error:
-                                with STATE.lock:
-                                    market["error"] = f"Exit monitoring: {error}"
+                    update_quote(symbol, quote)
                 else:
                     with STATE.lock:
                         STATE.markets[symbol].update(
@@ -534,11 +656,18 @@ def market_worker() -> None:
                         sort=Sort.DESC,
                         limit=MAX_BARS,
                     )
-                    bars = (
-                        option.get_option_bars(OptionBarsRequest(**args))
-                        if is_option
-                        else stock.get_stock_bars(StockBarsRequest(**args, feed=config.STOCK_FEED))
-                    )
+                    if is_crypto:
+                        bars = crypto.get_crypto_bars(
+                            CryptoBarsRequest(**args), feed=config.CRYPTO_FEED
+                        )
+                    elif is_option and option is not None:
+                        bars = option.get_option_bars(OptionBarsRequest(**args))
+                    elif stock is not None:
+                        bars = stock.get_stock_bars(
+                            StockBarsRequest(**args, feed=config.STOCK_FEED)
+                        )
+                    else:
+                        raise ValueError("Market data client is unavailable")
                     merge_bars(symbol, cast(BarSet, bars).data.get(symbol, []))
                     last_history[symbol] = time.time()
             except Exception as error:
@@ -620,7 +749,12 @@ class FeedHandler(BaseHTTPRequestHandler):
                 return
             if url.path == "/assets":
                 self.send_json(
-                    {"ok": True, "assets": TRADER.search_assets(query.get("query", [""])[0])}
+                    {
+                        "ok": True,
+                        "assets": TRADER.search_assets(
+                            query.get("query", [""])[0], query.get("asset_class", ["us_equity"])[0]
+                        ),
+                    }
                 )
                 return
             if url.path == "/contracts":
@@ -720,6 +854,8 @@ class FeedHandler(BaseHTTPRequestHandler):
                     quantity=payload.get("quantity"),
                     amount_usd=payload.get("amount_usd"),
                     limit_price=payload.get("limit_price"),
+                    stop_price=payload.get("stop_price"),
+                    time_in_force=payload.get("time_in_force"),
                     **fields,
                 )
             elif action in {"sell", "exit"}:
@@ -731,6 +867,8 @@ class FeedHandler(BaseHTTPRequestHandler):
                     if action == "sell"
                     else 1.0,
                     limit_price=payload.get("limit_price"),
+                    stop_price=payload.get("stop_price"),
+                    time_in_force=payload.get("time_in_force"),
                 )
             elif action == "update_tp_sl":
                 trade = TRADER.update_tp_sl(symbol, **fields)

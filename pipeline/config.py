@@ -30,6 +30,12 @@ if os.getenv("ALPACA_OPTION_SYMBOLS", "").strip():
 STOCK_FEED = DataFeed(os.getenv("ALPACA_STOCK_FEED", "iex"))
 OPTION_FEED = OptionsFeed(os.getenv("ALPACA_OPTION_FEED", "indicative"))
 CRYPTO_FEED = CryptoFeed.US
+# Seconds a quote's timestamp may lag. Alpaca stamps a quote when the top of book changes,
+# so a just-fetched crypto quote is the current 24/7 book even when quiet overnight; the
+# longer crypto window only guards against a frozen venue. Equity/option quotes keep the
+# strict window because an old stamp there means a closed session or halt.
+QUOTE_MAX_AGE_SECONDS = 30
+CRYPTO_QUOTE_MAX_AGE_SECONDS = 300
 if STOCK_FEED not in (DataFeed.IEX, DataFeed.SIP):
     raise ValueError("ALPACA_STOCK_FEED must be iex or sip")
 ALLOWED_ORIGINS = set(

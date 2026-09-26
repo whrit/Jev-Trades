@@ -368,9 +368,12 @@ class CryptoExecution(unittest.TestCase):
 
     def test_stale_crossed_quotes_and_ambiguous_submission_fail_closed(self):
         trader, broker, quotes = self._trader()
-        quotes.timestamp = datetime.now(timezone.utc) - timedelta(seconds=60)
+        # A quiet book (old stamp, just fetched) is current; a frozen venue is not.
+        quotes.timestamp = datetime.now(timezone.utc) - timedelta(seconds=600)
         with self.assertRaises(ValueError):
             trader.manual_buy(BTC, 60000, quantity=0.001)
+        quotes.timestamp = datetime.now(timezone.utc) - timedelta(seconds=60)
+        self.assertEqual(trader._quote(BTC, "buy"), quotes.ask)
         quotes.timestamp, quotes.bid, quotes.ask = datetime.now(timezone.utc), 60002.0, 60001.0
         with self.assertRaises(ValueError):
             trader.manual_buy(BTC, 60000, quantity=0.001)
@@ -489,11 +492,13 @@ class CryptoExecution(unittest.TestCase):
             "current_price": 60000,
             "strategy": "crypto",
             "time_frame": "1m",
-            "quote_time": time.time(),
+            "quote_time": time.time() - 60,  # quiet book: last change a minute ago is current
             "bar_time": time.time() - 60,
         }
         with self.assertRaises(ValueError):  # A stale bar/quote must not drive a crypto decision.
             trader._apply_decision({**state, "bar_time": time.time() - 600}, response)
+        with self.assertRaises(ValueError):  # A frozen venue is not a quiet book.
+            trader._apply_decision({**state, "quote_time": time.time() - 600}, response)
         event = trader._apply_decision(state, response)
         self.assertEqual((event["strategy"], event["executed"]), ("crypto", "submitted"))
         self.assertEqual(broker.requests[-1].symbol, BTC)

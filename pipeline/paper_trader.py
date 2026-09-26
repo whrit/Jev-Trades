@@ -740,7 +740,12 @@ class PaperTrader:
             )
         quote = quotes[symbol]
         age = (datetime.now(timezone.utc) - quote.timestamp).total_seconds()
-        if not -5 <= age <= 30:
+        limit = (
+            config.CRYPTO_QUOTE_MAX_AGE_SECONDS
+            if self.is_crypto(symbol)
+            else config.QUOTE_MAX_AGE_SECONDS
+        )
+        if not -5 <= age <= limit:
             raise ValueError("Market quote is stale; refusing an order")
         bid, ask = positive(quote.bid_price, "Bid"), positive(quote.ask_price, "Ask")
         if bid > ask:
@@ -1284,11 +1289,15 @@ class PaperTrader:
                 errors.append(f"{symbol}: {error}")
         self.monitor_error = "; ".join(errors) or None
 
-    @staticmethod
-    def _fresh_underlying(state: dict[str, Any]) -> None:
+    def _fresh_underlying(self, state: dict[str, Any]) -> None:
         now = time.time()
         quote_time, bar_time = state.get("quote_time"), state.get("bar_time")
-        if quote_time is None or not -5 <= now - quote_time <= 30:
+        limit = (
+            config.CRYPTO_QUOTE_MAX_AGE_SECONDS
+            if self.is_crypto(state["symbol"])
+            else config.QUOTE_MAX_AGE_SECONDS
+        )
+        if quote_time is None or not -5 <= now - quote_time <= limit:
             raise ValueError("Underlying quote is stale or unavailable")
         if bar_time is None or not 0 <= now - bar_time <= 180:
             raise ValueError("Underlying completed bars are stale or unavailable")

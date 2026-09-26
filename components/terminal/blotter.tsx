@@ -198,6 +198,8 @@ export function Blotter({
             "Status",
             ["Filled / Qty", "r"],
             ["Price", "r"],
+            "Source",
+            ["Submitted", "r"],
             "",
           ]}
         >
@@ -234,7 +236,15 @@ export function Blotter({
               <Num>
                 {order.price != null
                   ? money(order.price, priceDecimals(instruments[order.symbol]))
-                  : "awaiting fill"}
+                  : order.estimated_price != null
+                    ? `est ${money(order.estimated_price, priceDecimals(instruments[order.symbol]))}`
+                    : "awaiting fill"}
+              </Num>
+              <TableCell className="text-muted-foreground">
+                {order.source ?? "--"}
+              </TableCell>
+              <Num className="text-muted-foreground">
+                {order.submitted_at ? clock(order.submitted_at) : "--"}
               </Num>
               <TableCell className="text-right">
                 {order.id && (

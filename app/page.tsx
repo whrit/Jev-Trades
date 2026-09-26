@@ -201,10 +201,23 @@ export default function Home() {
     (assetMode === "crypto" ? setCryptoSymbol : setEquitySymbol)(ticker);
     setWorkspace("terminal");
   };
+  const account = snapshot?.trading.account;
   const errors = [
     feedError || snapshot?.trading.broker_error || snapshot?.error,
     snapshot?.trading.monitor_error &&
       `Exit monitor: ${snapshot.trading.monitor_error}`,
+    account?.trading_blocked && "Alpaca account is blocked for trading.",
+    assetMode === "crypto" &&
+      snapshot?.crypto_stream_error &&
+      `Crypto stream: ${snapshot.crypto_stream_error}`,
+    assetMode === "equities" &&
+      snapshot?.stock_stream_error &&
+      `Stock stream: ${snapshot.stock_stream_error}`,
+    assetMode === "equities" &&
+      !!snapshot?.options?.underlyings.length &&
+      account?.options_trading_level != null &&
+      account.options_trading_level < 2 &&
+      `Options trading level ${account.options_trading_level}; long options require level 2.`,
   ].filter(Boolean);
   const onDesk = workspace !== "settings";
 

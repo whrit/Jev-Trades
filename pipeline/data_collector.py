@@ -1,4 +1,5 @@
-"""Alpaca stock/options polling and live crypto data for the dashboard SSE feed."""
+"""Alpaca market data for the dashboard SSE feed: websocket streams for stocks and crypto
+(quotes, trades, minute bars) with REST polling for options and recovery."""
 
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ from alpaca.data.historical import (
     OptionHistoricalDataClient,
     StockHistoricalDataClient,
 )
-from alpaca.data.live import CryptoDataStream
+from alpaca.data.live import CryptoDataStream, StockDataStream
 from alpaca.data.models import BarSet
 from alpaca.data.requests import (
     CryptoBarsRequest,
@@ -53,20 +54,29 @@ MAX_BARS = 1000
 STORE_DIR = Path(__file__).with_name("alpaca_market_data")
 
 
+def blank_market() -> dict[str, Any]:
+    return {
+        "bars": [],
+        "live_bar": None,
+        "price": None,
+        "last_tick": None,
+        "status": "starting",
+        "error": None,
+    }
+
+
 class MarketState:
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.selected_symbol = next(iter(TRADER.symbols()), "")
         self.trading_enabled = False
-        self.markets = {
-            s: {"bars": [], "price": None, "last_tick": None, "status": "starting", "error": None}
-            for s in TRADER.symbols()
-        }
+        self.markets = {s: blank_market() for s in TRADER.symbols()}
         self.capital = 100_000.0
         self.max_wallet_position_pct = 0.75
         self.risk_appetite = "balanced"
         self.active_timeframes = ["1m"]
         self.crypto_stream_error: str | None = None
+        self.stock_stream_error: str | None = None
         self.chart_timeframe = "1m"
 
     def snapshot(self, symbol: str | None = None, timeframe: str | None = None) -> dict[str, Any]:
@@ -84,11 +94,14 @@ class MarketState:
                 raise ValueError("Unknown symbol or timeframe")
             if selected:
                 TRADER.chart_requests[selected] = time.time()
-            market = self.markets.setdefault(
-                selected,
-                {"bars": [], "price": None, "last_tick": None, "status": "starting", "error": None},
-            )
-            bars = resample_bars(market["bars"], tf)
+            market = self.markets.setdefault(selected, blank_market())
+            bars = market["bars"]
+            live = market.get("live_bar")
+            # The forming minute (built from trade prints) is shown on the chart only;
+            # indicators and strategy decisions below still use completed bars.
+            if live and (not bars or live["time"] > bars[-1]["time"]):
+                bars = [*bars[-(MAX_BARS - 1) :], live]
+            bars = resample_bars(bars, tf)
             completed = [bar for bar in bars if bar["time"] + TIMEFRAMES[tf] <= time.time()]
             price = market["price"] or (bars[-1]["close"] if bars else None)
             return {
@@ -116,6 +129,7 @@ class MarketState:
                     "crypto": config.CRYPTO_FEED.value,
                 },
                 "crypto_stream_error": self.crypto_stream_error,
+                "stock_stream_error": self.stock_stream_error,
                 "status": market["status"],
                 "error": market["error"],
                 "server_time": int(time.time()),
@@ -342,6 +356,9 @@ def merge_bars(symbol: str, incoming: list[Any]) -> None:
             }
         market["bars"] = [merged[t] for t in sorted(merged)[-MAX_BARS:]]
         latest = market["bars"][-1]["time"] if market["bars"] else None
+        live = market.get("live_bar")
+        if live and latest is not None and live["time"] <= latest:
+            market["live_bar"] = None  # The provider's completed bar supersedes it.
         STORE_DIR.mkdir(parents=True, exist_ok=True)
         path = STORE_DIR / f"{encode_symbol(symbol, safe='')}.json"
         temporary = path.with_suffix(".tmp")
@@ -479,9 +496,13 @@ def update_quote(symbol: str, quote: Any) -> None:
     age = time.time() - timestamp
     if age < -5:
         raise ValueError("Market quote timestamp is in the future")
-    fresh = age <= 30
+    fresh = age <= (
+        config.CRYPTO_QUOTE_MAX_AGE_SECONDS
+        if TRADER.is_crypto(symbol)
+        else config.QUOTE_MAX_AGE_SECONDS
+    )
     with STATE.lock:
-        market = STATE.markets.setdefault(symbol, {"bars": [], "last_tick": None})
+        market = STATE.markets.setdefault(symbol, blank_market())
         if market["last_tick"] is not None and timestamp < market["last_tick"]:
             return
         market.update(
@@ -498,27 +519,130 @@ def update_quote(symbol: str, quote: Any) -> None:
                 market["error"] = f"Exit monitoring: {error}"
 
 
-async def crypto_quote(quote: Any) -> None:
-    try:
-        await asyncio.to_thread(update_quote, quote.symbol, quote)
-        with STATE.lock:
-            STATE.crypto_stream_error = None
-    except Exception as error:
-        with STATE.lock:
-            STATE.crypto_stream_error = str(error)
-
-
-async def crypto_bar(bar: Any) -> None:
-    try:
-        with STATE.lock:
-            STATE.markets.setdefault(
-                bar.symbol,
-                {"bars": [], "price": None, "last_tick": None, "status": "starting", "error": None},
+def update_trade(symbol: str, trade: Any) -> None:
+    """Fold a real trade print into the forming minute candle (never a quote)."""
+    price, size = float(trade.price), float(trade.size)
+    if not (math.isfinite(price) and math.isfinite(size) and price > 0 and size >= 0):
+        raise ValueError("Invalid trade print")
+    stamp = trade.timestamp.timestamp()
+    if stamp - time.time() > 5:
+        raise ValueError("Trade timestamp is in the future")
+    minute = int(stamp // 60) * 60
+    with STATE.lock:
+        market = STATE.markets.setdefault(symbol, blank_market())
+        completed = market["bars"][-1]["time"] if market["bars"] else None
+        live = market.get("live_bar")
+        if (completed is not None and minute <= completed) or (live and minute < live["time"]):
+            return  # Late print for a minute that is already closed.
+        if live is None or minute > live["time"]:
+            market["live_bar"] = {
+                "time": minute,
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+                "volume": size,
+            }
+        else:
+            live.update(
+                high=max(live["high"], price),
+                low=min(live["low"], price),
+                close=price,
+                volume=live["volume"] + size,
             )
-        await asyncio.to_thread(merge_bars, bar.symbol, [bar])
-    except Exception as error:
-        with STATE.lock:
-            STATE.crypto_stream_error = str(error)
+
+
+def _set_stream_error(kind: str, error: Exception | None) -> None:
+    with STATE.lock:
+        setattr(STATE, f"{kind}_stream_error", None if error is None else str(error))
+
+
+def _handler(kind: str, apply: Any) -> Any:
+    async def handle(message: Any) -> None:
+        try:
+            with STATE.lock:
+                STATE.markets.setdefault(message.symbol, blank_market())
+            await asyncio.to_thread(apply, message.symbol, message)
+            _set_stream_error(kind, None)
+        except Exception as error:
+            _set_stream_error(kind, error)
+
+    return handle
+
+
+def _merge_one(symbol: str, bar: Any) -> None:
+    merge_bars(symbol, [bar])
+
+
+crypto_quote = _handler("crypto", update_quote)
+crypto_trade = _handler("crypto", update_trade)
+crypto_bar = _handler("crypto", _merge_one)
+stock_quote = _handler("stock", update_quote)
+stock_trade = _handler("stock", update_trade)
+stock_bar = _handler("stock", _merge_one)
+
+
+class LiveStream:
+    """One Alpaca websocket whose quote/trade/bar subscriptions follow the watched set."""
+
+    RESTART_SECONDS = 30
+
+    def __init__(self, kind: str, factory: Any, quote: Any, trade: Any, bar: Any) -> None:
+        self.kind, self.factory = kind, factory
+        self.quote, self.trade, self.bar = quote, trade, bar
+        self.stream: Any = None
+        self.thread: threading.Thread | None = None
+        self.subscribed: set[str] = set()
+        self.started = 0.0
+
+    def _subscribe(self, symbols: set[str]) -> None:
+        names = sorted(symbols)
+        self.stream.subscribe_quotes(self.quote, *names)
+        self.stream.subscribe_trades(self.trade, *names)
+        self.stream.subscribe_bars(self.bar, *names)
+        self.stream.subscribe_updated_bars(self.bar, *names)
+
+    def _unsubscribe(self, symbols: set[str]) -> None:
+        names = sorted(symbols)
+        self.stream.unsubscribe_quotes(*names)
+        self.stream.unsubscribe_trades(*names)
+        self.stream.unsubscribe_bars(*names)
+        self.stream.unsubscribe_updated_bars(*names)
+
+    def _run(self, stream: Any) -> None:
+        try:
+            stream.run()  # The SDK reconnects internally; returning means it gave up.
+        except Exception as error:
+            _set_stream_error(self.kind, error)
+
+    def sync(self, desired: set[str]) -> None:
+        try:
+            alive = self.thread is not None and self.thread.is_alive()
+            if desired and not alive:
+                if time.time() - self.started < self.RESTART_SECONDS:
+                    return  # Avoid reconnect storms (e.g. IEX's one-connection limit).
+                self.started = time.time()
+                self.stream = self.factory()
+                self._subscribe(desired)
+                self.subscribed = set(desired)
+                self.thread = threading.Thread(
+                    target=self._run, args=(self.stream,), daemon=True, name=f"alpaca-{self.kind}"
+                )
+                self.thread.start()
+            elif self.stream is not None and alive:
+                added, removed = desired - self.subscribed, self.subscribed - desired
+                if added:
+                    self._subscribe(added)
+                if removed:
+                    self._unsubscribe(removed)
+                self.subscribed = set(desired)
+                if not desired:
+                    self.stream.stop()
+                    if self.thread is not None:
+                        self.thread.join(timeout=5)
+                    self.stream, self.thread = None, None
+        except Exception as error:
+            _set_stream_error(self.kind, error)
 
 
 def market_worker() -> None:
@@ -528,9 +652,24 @@ def market_worker() -> None:
     crypto = (
         CryptoHistoricalDataClient(key, secret) if key and secret else CryptoHistoricalDataClient()
     )
-    stream: CryptoDataStream | None = None
-    stream_thread: threading.Thread | None = None
-    subscribed: set[str] = set()
+    streams = (
+        LiveStream(
+            "crypto",
+            # No data_timeout: quiet markets (closed equities, overnight crypto) send nothing
+            # for long stretches; the SDK's 10s websocket ping already detects dead sockets.
+            lambda: CryptoDataStream(*config.credentials(), feed=config.CRYPTO_FEED),
+            crypto_quote,
+            crypto_trade,
+            crypto_bar,
+        ),
+        LiveStream(
+            "stock",
+            lambda: StockDataStream(*config.credentials(), feed=config.STOCK_FEED),
+            stock_quote,
+            stock_trade,
+            stock_bar,
+        ),
+    )
     for symbol in TRADER.symbols():
         path = STORE_DIR / f"{encode_symbol(symbol, safe='')}.json"
         if path.exists():
@@ -565,51 +704,15 @@ def market_worker() -> None:
                     ]
                 )
             )
-        desired = {s for s in watched if TRADER.is_crypto(s)}
-        try:
-            if desired and (stream_thread is None or not stream_thread.is_alive()):
-                key, secret = config.credentials()
-                stream = CryptoDataStream(key, secret, feed=config.CRYPTO_FEED, data_timeout=30)
-                stream.subscribe_quotes(crypto_quote, *sorted(desired))
-                stream.subscribe_bars(crypto_bar, *sorted(desired))
-                stream.subscribe_updated_bars(crypto_bar, *sorted(desired))
-                subscribed = desired
-                stream_thread = threading.Thread(
-                    target=stream.run, daemon=True, name="alpaca-crypto-stream"
-                )
-                stream_thread.start()
-            elif stream is not None:
-                added, removed = desired - subscribed, subscribed - desired
-                if added:
-                    stream.subscribe_quotes(crypto_quote, *sorted(added))
-                    stream.subscribe_bars(crypto_bar, *sorted(added))
-                    stream.subscribe_updated_bars(crypto_bar, *sorted(added))
-                if removed:
-                    stream.unsubscribe_quotes(*sorted(removed))
-                    stream.unsubscribe_bars(*sorted(removed))
-                    stream.unsubscribe_updated_bars(*sorted(removed))
-                subscribed = desired
-                if not desired:
-                    stream.stop()
-                    if stream_thread is not None:
-                        stream_thread.join(timeout=5)
-        except Exception as error:
-            with STATE.lock:
-                STATE.crypto_stream_error = str(error)
+        crypto_symbols = {s for s in watched if TRADER.is_crypto(s)}
+        stock_symbols = {s for s in watched if not TRADER.is_crypto(s) and not TRADER.is_option(s)}
+        streams[0].sync(crypto_symbols)
+        streams[1].sync(stock_symbols)
 
         for symbol in watched:
             try:
                 with STATE.lock:
-                    STATE.markets.setdefault(
-                        symbol,
-                        {
-                            "bars": [],
-                            "price": None,
-                            "last_tick": None,
-                            "status": "starting",
-                            "error": None,
-                        },
-                    )
+                    STATE.markets.setdefault(symbol, blank_market())
                 if clients is None and not TRADER.is_crypto(symbol):
                     key, secret = config.credentials()
                     clients = (

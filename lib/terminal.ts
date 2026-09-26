@@ -21,6 +21,9 @@ export type Trade = {
   filled_qty?: number;
   timestamp: number;
   reason?: string;
+  /** Order origin: "manual", "jev", "stop_loss", "take_profit", ... */
+  source?: string;
+  submitted_at?: number;
   tp?: number | null;
   sl?: number | null;
   is_manual?: boolean;
@@ -76,6 +79,14 @@ export type OptionCandidate = {
   max_quantity: number;
   cost_per_contract: number;
   limit_price: number;
+  bid_size: number;
+  ask_size: number;
+  quote_time: number;
+  greeks: Record<
+    "delta" | "gamma" | "rho" | "theta" | "vega",
+    number | null
+  > | null;
+  implied_volatility: number | null;
 };
 export type OptionScan = {
   status: string;
@@ -140,6 +151,7 @@ export type Snapshot = {
   symbol: string;
   supported_symbols: string[];
   trading_scope?: TradingScope;
+  /** Quote state: starting | cached | live | stale quote | no quote | unavailable. */
   status: string;
   error: string | null;
   instruments: Record<string, Instrument>;
@@ -148,8 +160,12 @@ export type Snapshot = {
   price: number | null;
   bars: Bar[];
   indicators: Record<string, number | null>;
-  indicator_series: { ema20: (number | null)[]; sma50: (number | null)[] };
+  /** Full-length moving-average series (EMA/SMA 10-200) aligned to `bars`. */
+  indicator_series: Record<string, (number | null)[]>;
   last_tick: number | null;
+  server_time: number;
+  crypto_stream_error?: string | null;
+  stock_stream_error?: string | null;
   trading: {
     account: {
       starting_cash: number;
@@ -159,6 +175,9 @@ export type Snapshot = {
       options_exposure?: number | null;
       crypto_status?: string | null;
       crypto_buying_power?: number | null;
+      options_buying_power?: number;
+      options_trading_level?: number;
+      trading_blocked?: boolean;
       positions: Record<string, Position>;
       max_wallet_position_pct: number;
       risk_appetite: string;
@@ -191,13 +210,24 @@ export const chartColors = {
   text: "#8a93a3",
   grid: "rgba(255,255,255,0.035)",
   border: "rgba(255,255,255,0.07)",
-  up: "#34c38f",
+  up: "#72a7f7",
   down: "#f0616b",
-  upVolume: "rgba(52,195,143,0.28)",
+  upVolume: "rgba(114,167,247,0.28)",
   downVolume: "rgba(240,97,107,0.28)",
   accent: "#72a7f7",
-  ema20: "#e6b450",
-  sma50: "#7cc4d8",
+};
+
+/** Picker key → feed `indicator_series` key (20/50 keep legacy names). */
+export const overlaySeriesKey = (key: string) =>
+  key === "ema_20" ? "ema20" : key === "sma_50" ? "sma50" : key;
+/** One hue per period; EMAs draw solid, SMAs dashed. */
+export const periodColors: Record<string, string> = {
+  "10": "#e6b450",
+  "20": "#7cc4d8",
+  "30": "#d98ad6",
+  "50": "#f0915f",
+  "100": "#9fc27a",
+  "200": "#d7dbe3",
 };
 
 export const feedBase =
@@ -274,6 +304,17 @@ export const money = (value: number | null | undefined, decimals = 2) =>
     : `$${value.toLocaleString(undefined, { minimumFractionDigits: Math.min(2, decimals), maximumFractionDigits: decimals })}`;
 export const signedMoney = (value: number | null | undefined) =>
   value == null ? "--" : `${value >= 0 ? "+" : "-"}${money(Math.abs(value))}`;
+/** Compact elapsed time, e.g. 42s, 7m, 9h, 3d. */
+export const age = (seconds: number) => {
+  const s = Math.max(0, Math.round(seconds));
+  return s < 60
+    ? `${s}s`
+    : s < 3600
+      ? `${Math.floor(s / 60)}m`
+      : s < 86400
+        ? `${Math.floor(s / 3600)}h`
+        : `${Math.floor(s / 86400)}d`;
+};
 export const qty = (value: number, instrument?: InstrumentInfo) =>
   value.toLocaleString(undefined, {
     maximumFractionDigits: qtyDecimals(instrument),

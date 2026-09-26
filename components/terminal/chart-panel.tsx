@@ -14,11 +14,13 @@ import {
 } from "@/components/ui/popover";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import {
-  chartColors,
+  age,
   decimalsFromIncrement,
   indicatorGroups,
   indicatorLabel,
   money,
+  overlaySeriesKey,
+  periodColors,
   priceDecimals,
   TIMEFRAMES,
   type Instrument,
@@ -29,10 +31,17 @@ import { cn } from "@/lib/utils";
 
 const MarketChart = dynamic(() => import("./market-chart"), { ssr: false });
 
-const overlayOptions = [
-  ["ema20", "EMA 20", chartColors.ema20],
-  ["sma50", "SMA 50", chartColors.sma50],
-] as const;
+/** Moving averages the feed ships as full series are drawn on the chart. */
+const maOverlay = (key: string) => {
+  const match = /^(ema|sma)_(\d+)$/.exec(key);
+  return match && periodColors[match[2]]
+    ? {
+        series: overlaySeriesKey(key),
+        color: periodColors[match[2]],
+        dashed: match[1] === "sma",
+      }
+    : null;
+};
 
 export function ChartPanel({
   snapshot,
@@ -59,7 +68,6 @@ export function ChartPanel({
   onOpenSearch: () => void;
   hidden?: boolean;
 }) {
-  const [overlays, setOverlays] = useState<string[]>(["ema20"]);
   const [indicators, setIndicators] = useState([
     "ema_20",
     "sma_50",
@@ -70,6 +78,12 @@ export function ChartPanel({
     list.includes(name)
       ? list.filter((item) => item !== name)
       : [...list, name];
+  const overlays = indicators.flatMap((key) => {
+    const overlay = maOverlay(key);
+    return overlay && snapshot?.indicator_series[overlay.series]
+      ? [overlay]
+      : [];
+  });
 
   const firstOpen = symbolReady ? snapshot?.bars[0]?.open : undefined;
   const change =
@@ -131,6 +145,25 @@ export function ChartPanel({
               ? "awaiting quote"
               : `${change >= 0 ? "+" : ""}${change.toFixed(2)}%`}
           </span>
+          {symbolReady && snapshot && (
+            <span
+              className={cn(
+                "text-[0.6875rem]",
+                snapshot.status === "live" ? "text-up" : "text-warn",
+              )}
+              title={
+                snapshot.error ??
+                (isCrypto
+                  ? "Crypto quotes are current until the book changes; orders refuse quotes older than 5 minutes"
+                  : "Orders refuse quotes older than 30 seconds")
+              }
+            >
+              {snapshot.status}
+              {snapshot.status !== "live" &&
+                snapshot.last_tick != null &&
+                ` ${age(snapshot.server_time - snapshot.last_tick)}`}
+            </span>
+          )}
         </div>
         <div className="ml-auto flex items-center gap-1">
           <ToggleGroup
@@ -165,17 +198,6 @@ export function ChartPanel({
               align="end"
               className="max-h-[70dvh] w-72 overflow-y-auto p-0"
             >
-              <PickerGroup title="Chart overlays">
-                {overlayOptions.map(([key, label, color]) => (
-                  <PickerItem
-                    key={key}
-                    label={label}
-                    checked={overlays.includes(key)}
-                    onChange={() => setOverlays((list) => toggle(list, key))}
-                    swatch={color}
-                  />
-                ))}
-              </PickerGroup>
               {indicatorGroups.map((group) => (
                 <PickerGroup key={group.title} title={group.title}>
                   {group.items.map(([key, label]) => (
@@ -186,6 +208,8 @@ export function ChartPanel({
                       onChange={() =>
                         setIndicators((list) => toggle(list, key))
                       }
+                      swatch={maOverlay(key)?.color}
+                      dashed={maOverlay(key)?.dashed}
                     />
                   ))}
                 </PickerGroup>
@@ -241,7 +265,7 @@ export function ChartPanel({
   );
 }
 
-/** Last price that tints green/red for a moment whenever it ticks. */
+/** Last price that tints blue/red for a moment whenever it ticks. */
 function LastPrice({ price, text }: { price: number | null; text: string }) {
   const [previous, setPrevious] = useState(price);
   const [direction, setDirection] = useState(0);
@@ -287,11 +311,13 @@ function PickerItem({
   checked,
   onChange,
   swatch,
+  dashed,
 }: {
   label: string;
   checked: boolean;
   onChange: () => void;
   swatch?: string;
+  dashed?: boolean;
 }) {
   return (
     <label className="flex h-7 cursor-pointer items-center gap-2 rounded-sm px-1 hover:bg-accent">
@@ -300,8 +326,12 @@ function PickerItem({
       {swatch && (
         <span
           aria-hidden
-          className="ml-auto h-0.5 w-3 rounded-full"
-          style={{ background: swatch }}
+          title="Drawn on chart"
+          className={cn(
+            "mr-1 ml-auto w-3 border-t-2",
+            dashed && "border-dashed",
+          )}
+          style={{ borderColor: swatch }}
         />
       )}
     </label>

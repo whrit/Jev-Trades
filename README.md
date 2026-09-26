@@ -75,11 +75,14 @@ The response includes `option_contracts` and `next_page_token`; pass `page_token
 
 ## Market data
 
-Stocks/options use REST polling; crypto adds WebSocket streaming and retains REST history/quote recovery:
+Stocks and crypto stream over Alpaca WebSockets (`StockDataStream` on the configured stock feed, `CryptoDataStream`); options use REST polling. REST history/quote polling is retained for recovery on every asset class:
 
-- Configured stock symbols, option underlyings, and crypto pairs are watched independently of the chart. Quotes and active contract charts are polled every five seconds; displayed prices are midpoints. The options shortlist does not create a historical-bars subscription for every contract.
-- Completed one-minute OHLCV bars are polled every minute. Startup requests up to 1,000 recent bars per symbol from the preceding seven days; subsequent polls refresh the last five minutes.
+- Configured stock symbols, option underlyings, and crypto pairs are watched independently of the chart. Stock and crypto quotes, trades, minute bars, and bar corrections stream for watched symbols; option quotes and active contract charts are polled every five seconds. Displayed prices are midpoints. The options shortlist does not create a historical-bars subscription for every contract.
+- The chart's forming minute candle is built from streamed **trade prints** and is replaced by the provider's completed bar when it arrives. Indicators and strategy decisions use completed bars only.
+- Completed one-minute OHLCV bars also stream, and are polled every minute as a fallback. Startup requests up to 1,000 recent bars per symbol from the preceding seven days; subsequent polls refresh the last five minutes.
 - Broker-provided bar timestamps are upsert keys. Corrections replace bars instead of double-counting volume. Quotes never fabricate candles or trade volume.
+- Alpaca stamps a quote when the top of book changes, so a quiet book keeps an old timestamp even while current. Stock and option quotes older than 30 seconds are `stale quote` and refuse orders and exit checks (closed session, halt, or thin IEX ticker). Crypto trades 24/7, so a just-received crypto quote stays `live` for up to 5 minutes (`CRYPTO_QUOTE_MAX_AGE_SECONDS` in `pipeline/config.py`); beyond that the venue is treated as frozen and orders are refused.
+- Alpaca allows one market-data WebSocket per account per asset class. Run a single feed process; a second one (or another app on the same key) gets `connection limit exceeded`.
 - Charts support 1m, 5m, 15m, 1h, and 4h aggregation, existing moving averages, oscillators, and TP/SL overlays. Sparse or insufficient history displays warming indicators.
 - Cached bars are stored in `pipeline/alpaca_market_data/`; pair separators are percent-encoded (`BTC%2FUSD.json`), never interpreted as directories. Cached/stale data is not represented as live quotes.
 
@@ -87,7 +90,7 @@ Broker reconciliation and option lifecycle monitoring run every three seconds; s
 
 `ALPACA_STOCK_FEED=iex` is the default; use `sip` only with the necessary entitlement. IEX is not the consolidated market. Options default to `indicative`, which supports automatic discovery, paper entries and monitored exits without an OPRA subscription. Its quotes are derived rather than executable OPRA/NBBO, and trades are delayed 15 minutes. Spread/depth filters measure that indicative feed; paper results do not establish live execution quality. Optional `opra` supplies consolidated quotes and requires a working entitlement. Requests always use the configured feed; entitlement errors are surfaced, not silently replaced with another feed. Historical option bars use the SDK endpoint without a feed selector; options and equities have different historical availability.
 
-Orders require a quote no more than 30 seconds old. Stocks/options also require an open regular session; crypto does not. Automated decisions require newly completed bars no more than three minutes old. Delayed feeds, quiet instruments, closed equity markets, and stale quotes prevent trading rather than bypass these guards.
+Stock and option orders require a quote no more than 30 seconds old; crypto orders require one no more than 5 minutes old (see above). Stocks/options also require an open regular session; crypto does not. Automated decisions require newly completed bars no more than three minutes old. Delayed feeds, quiet instruments, closed equity markets, and stale quotes prevent trading rather than bypass these guards.
 
 ## Paper trading workflow
 
@@ -203,7 +206,7 @@ The service binds to loopback by default. Browser origins are restricted to `htt
 
 `oxlint.config.ts` and `oxfmt.config.ts` are auto-discovered from the repository root. Oxlint runs native TypeScript, React/hooks, Next.js, accessibility, import, Unicorn, and Oxc correctness checks; warnings and unused suppression directives fail the check. Browser/Node globals use built-in environments rather than a generated globals list. TypeScript compiler checking remains a separate `tsc` step; experimental Oxlint type checking and React Compiler rules are not enabled.
 
-Oxfmt owns formatting for frontend code, CSS, JSON, Markdown, and supported project configuration files, using an 80-column print width. Generated output, lockfiles, agent instructions, and the Python pipeline are excluded. Python formatting remains with Ruff. UI primitives are shadcn/ui (Radix, `radix-mira` style, Phosphor icons) in `components/ui/`, owned and customized in place; terminal panels live in `components/terminal/`. The dashboard is dark-only with a single blue accent; green and red are reserved for direction (buy/gain, sell/loss/error). Theme tokens are in `app/globals.css`, mirrored for the chart canvas in `lib/terminal.ts`.
+Oxfmt owns formatting for frontend code, CSS, JSON, Markdown, and supported project configuration files, using an 80-column print width. Generated output, lockfiles, agent instructions, and the Python pipeline are excluded. Python formatting remains with Ruff. UI primitives are shadcn/ui (Radix, `radix-mira` style, Phosphor icons) in `components/ui/`, owned and customized in place; terminal panels live in `components/terminal/`. The dashboard is dark-only with a single blue accent; blue also marks buy/gain, and red is reserved for sell/loss/error. Theme tokens are in `app/globals.css`, mirrored for the chart canvas in `lib/terminal.ts`.
 
 ```sh
 pnpm lint          # Check source; no writes

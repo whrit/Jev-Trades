@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from alpaca.data.models import Bar, Quote
+from alpaca.data.models import Bar, Quote, Trade
 from pydantic import ValidationError
 
 with patch.dict(os.environ, {}, clear=True), patch("dotenv.load_dotenv"):
@@ -135,6 +135,49 @@ class CryptoData(unittest.TestCase):
         self.assertFalse((feed.STORE_DIR / "BTC").exists())
         self.assertEqual(db.get_orders(), [])
 
+    def test_trade_prints_build_forming_candle_until_completed_bar_supersedes_it(self):
+        feed = self.feed
+        minute = int(time.time() // 60) * 60
+
+        def trade(offset: float, price: float, size: float) -> Trade:
+            stamp = datetime.fromtimestamp(minute + offset, timezone.utc)
+            return Trade("BTC/USD", {"t": stamp, "p": price, "s": size, "i": 1, "x": "CBSE"})
+
+        closed = Bar(
+            "BTC/USD",
+            {
+                "t": datetime.fromtimestamp(minute - 60, timezone.utc),
+                "o": 100,
+                "h": 101,
+                "l": 99,
+                "c": 100,
+                "v": 5,
+                "n": 5,
+                "vw": 100,
+            },
+        )
+        asyncio.run(feed.crypto_bar(closed))
+        for message in (trade(1, 102, 1), trade(2, 104, 2), trade(3, 101, 0.5)):
+            asyncio.run(feed.crypto_trade(message))
+        asyncio.run(feed.crypto_trade(trade(-30, 1, 99)))  # late print for a closed minute
+        snapshot = feed.STATE.snapshot("BTC/USD")
+        forming = snapshot["bars"][-1]
+        self.assertEqual(forming["time"], minute)
+        self.assertEqual(
+            (forming["open"], forming["high"], forming["low"], forming["close"]),
+            (102, 104, 101, 101),
+        )
+        self.assertEqual(forming["volume"], 3.5)
+        self.assertEqual(snapshot["bars"][-2]["volume"], 5)  # closed bar untouched
+        self.assertEqual(snapshot["indicators"], feed.calculate_indicators([closed_bar(closed)]))
+        with patch.object(feed.time, "time", return_value=minute + 61):
+            forming_bar = closed.model_copy(
+                update={"timestamp": datetime.fromtimestamp(minute, timezone.utc)}
+            )
+            asyncio.run(feed.crypto_bar(forming_bar))
+            self.assertIsNone(feed.STATE.markets["BTC/USD"]["live_bar"])
+        self.assertEqual(db.get_orders(), [])
+
     def test_subcent_indicators_preserve_price_and_volatility(self):
         price = 0.00000001234
         bars = [
@@ -155,6 +198,17 @@ class CryptoData(unittest.TestCase):
         self.assertAlmostEqual(ema, price, delta=1e-20)
         self.assertAlmostEqual(atr, 2e-9, delta=1e-20)
         self.assertAlmostEqual(sma, price, delta=1e-20)
+
+
+def closed_bar(bar: Bar) -> dict[str, float]:
+    return {
+        "time": int(bar.timestamp.timestamp()),
+        "open": bar.open,
+        "high": bar.high,
+        "low": bar.low,
+        "close": bar.close,
+        "volume": bar.volume,
+    }
 
 
 if __name__ == "__main__":

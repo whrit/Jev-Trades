@@ -304,9 +304,18 @@ function OptionRow({
             <span>{money(candidate.limit_price)}</span>
             <span />
             <span className="col-span-2 text-muted-foreground">
+              {money(candidate.bid)}×{candidate.bid_size} /{" "}
+              {money(candidate.ask)}×{candidate.ask_size}
+              {candidate.greeks?.delta != null &&
+                ` · Δ ${candidate.greeks.delta.toFixed(2)}`}
+              {candidate.implied_volatility != null &&
+                ` · IV ${(candidate.implied_volatility * 100).toFixed(0)}%`}
+            </span>
+            <span />
+            <span className="col-span-2 text-muted-foreground">
               OI {candidate.open_interest} · spr{" "}
               {(candidate.spread_pct * 100).toFixed(1)}% · max{" "}
-              {candidate.max_quantity} ct
+              {candidate.max_quantity} ct · quote {clock(candidate.quote_time)}
             </span>
           </button>
         ))}

@@ -4,9 +4,9 @@
 
 @custom-variant dark (&:is(.dark *));
 
-/* Dark-only terminal palette. Blue is the single interactive accent; green and
-   red are reserved for direction (buy/gain, sell/loss/error). Chart colors in
-   components/terminal/market-chart.tsx mirror these values. */
+/* Dark-only terminal palette. Blue is the interactive accent and also marks
+   buy/gain (--up); red is reserved for sell/loss/error. Chart colors in
+   lib/terminal.ts (chartColors) mirror these values. */
 :root {
   color-scheme: dark;
   --radius: 0.3rem;
@@ -25,7 +25,7 @@
   --accent: #1d232c;
   --accent-foreground: #e4e7ed;
   --destructive: #f0616b;
-  --up: #34c38f;
+  --up: #72a7f7;
   --down: #f0616b;
   --warn: #e6b450;
   --border: rgb(255 255 255 / 7%);

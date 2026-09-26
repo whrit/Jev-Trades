@@ -17,7 +17,7 @@ import { chartColors as colors, type Bar, type Snapshot } from "@/lib/terminal";
 
 const volumeColor = (bar: Bar) =>
   bar.close >= bar.open ? colors.upVolume : colors.downVolume;
-type IndicatorSeries = Snapshot["indicator_series"];
+export type Overlay = { series: string; color: string; dashed: boolean };
 type PositionData = {
   average_entry_price?: number;
   stop_loss_price?: number | null;
@@ -33,8 +33,8 @@ export default function MarketChart({
   priceFormat,
 }: {
   bars: Bar[];
-  indicatorSeries: IndicatorSeries;
-  overlays: string[];
+  indicatorSeries: Snapshot["indicator_series"];
+  overlays: Overlay[];
   position?: PositionData | null;
   priceFormat?: { minMove: number; precision: number };
 }) {
@@ -43,9 +43,8 @@ export default function MarketChart({
   const seriesRef = useRef<{
     candles?: ISeriesApi<"Candlestick">;
     volume?: ISeriesApi<"Histogram">;
-    ema20?: ISeriesApi<"Line">;
-    sma50?: ISeriesApi<"Line">;
   }>({});
+  const linesRef = useRef(new Map<string, ISeriesApi<"Line">>());
   const priceLinesRef = useRef<{
     entry?: IPriceLine | null;
     tp?: IPriceLine | null;
@@ -53,7 +52,6 @@ export default function MarketChart({
   }>({});
   const initializedRef = useRef(false);
   const renderedTimeRef = useRef<number | null>(null);
-  const overlayStateRef = useRef("");
   const { average_entry_price, stop_loss_price, take_profit_price, quantity } =
     position ?? {};
 
@@ -61,7 +59,7 @@ export default function MarketChart({
     if (!containerRef.current) return;
     initializedRef.current = false;
     renderedTimeRef.current = null;
-    overlayStateRef.current = "";
+    linesRef.current.clear();
     priceLinesRef.current = {};
     const chart = createChart(containerRef.current, {
       autoSize: true,
@@ -112,8 +110,9 @@ export default function MarketChart({
     };
   }, []);
   useEffect(() => {
-    for (const name of ["candles", "ema20", "sma50"] as const) {
-      seriesRef.current[name]?.applyOptions({
+    const lines = [seriesRef.current.candles, ...linesRef.current.values()];
+    for (const series of lines) {
+      series?.applyOptions({
         priceFormat: {
           type: "price",
           minMove: priceFormat?.minMove ?? 0.01,
@@ -190,17 +189,21 @@ export default function MarketChart({
     renderedTimeRef.current = latestBar.time;
     const chart = chartRef.current;
     if (!chart) return;
-    const overlayState = overlays.join(",");
-    for (const name of ["ema20", "sma50"] as const) {
-      if (!overlays.includes(name)) {
-        if (overlayStateRef.current.includes(name))
-          seriesRef.current[name]?.setData([]);
-        continue;
-      }
-      if (!seriesRef.current[name]) {
-        seriesRef.current[name] = chart.addSeries(LineSeries, {
-          color: name === "ema20" ? colors.ema20 : colors.sma50,
+    const wanted = new Set(overlays.map((overlay) => overlay.series));
+    for (const [name, line] of linesRef.current) {
+      if (wanted.has(name)) continue;
+      chart.removeSeries(line);
+      linesRef.current.delete(name);
+    }
+    for (const { series: name, color, dashed } of overlays) {
+      const values = indicatorSeries[name];
+      if (!values) continue;
+      let line = linesRef.current.get(name);
+      if (!line) {
+        line = chart.addSeries(LineSeries, {
+          color,
           lineWidth: 1,
+          lineStyle: dashed ? LineStyle.Dashed : LineStyle.Solid,
           priceLineVisible: false,
           lastValueVisible: false,
           crosshairMarkerVisible: false,
@@ -210,13 +213,12 @@ export default function MarketChart({
             precision: priceFormat?.precision ?? 2,
           },
         });
+        linesRef.current.set(name, line);
       }
-      const values =
-        name === "ema20" ? indicatorSeries.ema20 : indicatorSeries.sma50;
       // Always use setData for overlays to avoid time mismatch issues with update()
-      seriesRef.current[name].setData(
+      line.setData(
         sortedBars.slice(0, values.length).flatMap((bar, index) =>
-          values[index] === null
+          values[index] == null
             ? []
             : [
                 {
@@ -227,7 +229,6 @@ export default function MarketChart({
         ),
       );
     }
-    overlayStateRef.current = overlayState;
   }, [
     bars,
     indicatorSeries,

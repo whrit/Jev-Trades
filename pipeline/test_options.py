@@ -151,6 +151,7 @@ class DiscoverPaginationTests(unittest.TestCase):
                 "AAPL",
                 1000,
                 now=NOW,
+                policy=config.OPTIONS,
             )
             self.assertEqual([c["symbol"] for c in result["candidates"]], [last.symbol])
 
@@ -175,6 +176,7 @@ class DiscoverPaginationTests(unittest.TestCase):
                 "AAPL",
                 1000,
                 now=NOW,
+                policy=config.OPTIONS,
             )
             self.assertEqual(result["discovered"], 5)
             self.assertEqual(result["eligible"], 5)
@@ -196,6 +198,7 @@ class DiscoverPaginationTests(unittest.TestCase):
                     "AAPL",
                     1000,
                     now=NOW,
+                    policy=config.OPTIONS,
                 )
 
 
@@ -236,6 +239,7 @@ class DiscoverMetadataFilterTests(unittest.TestCase):
                 "AAPL",
                 1000,
                 now=NOW,
+                policy=config.OPTIONS,
             )
             self.assertEqual(result["discovered"], 9)
             self.assertEqual(result["eligible"], 1)
@@ -284,6 +288,7 @@ class DiscoverQuoteFilterTests(unittest.TestCase):
                 "AAPL",
                 1000,
                 now=NOW,
+                policy=config.OPTIONS,
             )
             self.assertEqual(
                 result["rejections"],
@@ -313,6 +318,7 @@ class AffordabilityTests(unittest.TestCase):
                 "AAPL",
                 110,
                 now=NOW,
+                policy=config.OPTIONS,
             )
             self.assertEqual(
                 [(c["limit_price"], c["max_quantity"]) for c in result["candidates"]], [(1.1, 1)]
@@ -333,6 +339,7 @@ class AffordabilityTests(unittest.TestCase):
                 "AAPL",
                 450,
                 now=NOW,
+                policy=config.OPTIONS,
             )
             candidate = result["candidates"][0]
             self.assertEqual(candidate["limit_price"], 2.01)
@@ -354,6 +361,7 @@ class AffordabilityTests(unittest.TestCase):
                 "AAPL",
                 500,
                 now=NOW,
+                policy=config.OPTIONS,
             )
             self.assertEqual(result["eligible"], 0)
             self.assertEqual(result["rejections"], {"unaffordable": 1})
@@ -383,6 +391,7 @@ class ShortlistTests(unittest.TestCase):
                 "AAPL",
                 1000,
                 now=NOW,
+                policy=config.OPTIONS,
             )
             # 6 contracts pass every filter; eligible reflects that even though the shortlist caps at 4.
             self.assertEqual(result["eligible"], 6)
@@ -403,15 +412,23 @@ class IndicativeFeedTests(unittest.TestCase):
             data.snapshots[contract.symbol] = make_snapshot(contract.symbol, bid=2, ask=2.05)
             broker = cast(TradingClient, trading)
             quotes = cast(OptionHistoricalDataClient, data)
-            scan = options.discover_candidates(broker, quotes, "AAPL", 1000, now=NOW)
+            scan = options.discover_candidates(
+                broker, quotes, "AAPL", 1000, now=NOW, policy=config.OPTIONS
+            )
             self.assertEqual([c["symbol"] for c in scan["candidates"]], [contract.symbol])
             candidate = options.validate_candidate(
-                broker, quotes, contract.symbol, "AAPL", 1000, now=NOW
+                broker, quotes, contract.symbol, "AAPL", 1000, now=NOW, policy=config.OPTIONS
             )
             self.assertEqual(candidate["max_quantity"], 4)
             with self.assertRaises(ValueError):
                 options.validate_candidate(
-                    broker, quotes, contract.symbol, "AAPL", 1000, now=NOW + timedelta(seconds=31)
+                    broker,
+                    quotes,
+                    contract.symbol,
+                    "AAPL",
+                    1000,
+                    now=NOW + timedelta(seconds=31),
+                    policy=config.OPTIONS,
                 )
 
 
@@ -433,6 +450,7 @@ class ValidateCandidateTests(unittest.TestCase):
                         contract.symbol,
                         "AAPL",
                         1000,
+                        policy=config.OPTIONS,
                     )
 
     def test_broker_cannot_substitute_a_different_contract_on_same_underlying(self):
@@ -449,6 +467,7 @@ class ValidateCandidateTests(unittest.TestCase):
                     "AAPL",
                     1000,
                     now=NOW,
+                    policy=config.OPTIONS,
                 )
 
     def test_rejects_symbol_whose_broker_underlying_does_not_match_requested_underlying(self):
@@ -464,6 +483,7 @@ class ValidateCandidateTests(unittest.TestCase):
                     "AAPL",
                     1000,
                     now=NOW,
+                    policy=config.OPTIONS,
                 )
 
     def test_rejects_symbol_that_fails_current_eligibility_checks(self):
@@ -479,6 +499,7 @@ class ValidateCandidateTests(unittest.TestCase):
                     "AAPL",
                     1000,
                     now=NOW,
+                    policy=config.OPTIONS,
                 )
 
     def test_rejects_ask_price_drift_beyond_tolerance_and_accepts_within_tolerance(self):
@@ -496,6 +517,7 @@ class ValidateCandidateTests(unittest.TestCase):
                     1000,
                     expected_price=2.00,
                     now=NOW,
+                    policy=config.OPTIONS,
                 )
             candidate = options.validate_candidate(
                 cast(TradingClient, trading),
@@ -505,6 +527,7 @@ class ValidateCandidateTests(unittest.TestCase):
                 1000,
                 expected_price=2.06,
                 now=NOW,
+                policy=config.OPTIONS,
             )
             self.assertEqual(candidate["symbol"], contract.symbol)
             self.assertEqual(candidate["ask"], 2.10)

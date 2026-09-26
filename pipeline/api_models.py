@@ -6,14 +6,34 @@ from pydantic import ConfigDict, Field, NonNegativeFloat, PositiveFloat, TypeAda
 
 
 @with_config(ConfigDict(strict=True, extra="forbid", allow_inf_nan=False))
+class OptionPolicyPatch(TypedDict, total=False):
+    max_trade_pct: Annotated[float, Field(gt=0, le=1)]
+    max_underlying_pct: Annotated[float, Field(gt=0, le=1)]
+    max_total_pct: Annotated[float, Field(gt=0, le=1)]
+    max_positions_per_underlying: Annotated[int, Field(ge=1)]
+    max_contracts: Annotated[int, Field(ge=1)]
+    min_confidence: Annotated[float, Field(ge=0, le=1)]
+
+
+@with_config(ConfigDict(strict=True, extra="forbid"))
+class TradingScopePatch(TypedDict, total=False):
+    stock_symbols: list[str]
+    option_underlyings: list[str]
+    stock_symbol: str
+    stock_enabled: bool
+    options_enabled: bool
+
+
+@with_config(ConfigDict(strict=True, extra="forbid", allow_inf_nan=False))
 class ConfigPayload(TypedDict, total=False):
-    symbol: str
+    trading_scope: TradingScopePatch
     trading_enabled: bool
     active_timeframes: Annotated[list[str], Field(min_length=1)]
     capital: PositiveFloat
     max_wallet_position_pct: Annotated[float, Field(gt=0, le=1)]
     risk_appetite: Literal["conservative", "balanced", "aggressive"]
     typesafe_api_key: str
+    option_policy: OptionPolicyPatch
 
 
 @with_config(ConfigDict(strict=True, extra="forbid", allow_inf_nan=False))

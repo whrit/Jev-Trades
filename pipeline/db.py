@@ -36,6 +36,12 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS decisions (
                 timestamp REAL NOT NULL, payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS option_policy (
+                id INTEGER PRIMARY KEY CHECK (id = 1), payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS trading_scope (
+                id INTEGER PRIMARY KEY CHECK (id = 1), payload TEXT NOT NULL
+            );
         """)
 
 
@@ -72,3 +78,25 @@ def delete_exits(symbol: str) -> None:
 def log_decision(event: dict[str, Any]) -> None:
     with get_connection() as conn:
         conn.execute("INSERT INTO decisions VALUES (?, ?)", (time.time(), json.dumps(event)))
+
+
+def get_option_policy() -> dict[str, Any]:
+    with get_connection() as conn:
+        row = conn.execute("SELECT payload FROM option_policy WHERE id = 1").fetchone()
+        return json.loads(row[0]) if row else {}
+
+
+def get_trading_scope() -> dict[str, Any]:
+    with get_connection() as conn:
+        row = conn.execute("SELECT payload FROM trading_scope WHERE id = 1").fetchone()
+        return json.loads(row[0]) if row else {}
+
+
+def save_configuration(policy: dict[str, Any] | None, scope: dict[str, Any] | None) -> None:
+    with get_connection() as conn:
+        if policy is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO option_policy VALUES (1, ?)", (json.dumps(policy),)
+            )
+        if scope is not None:
+            conn.execute("INSERT OR REPLACE INTO trading_scope VALUES (1, ?)", (json.dumps(scope),))

@@ -264,6 +264,9 @@ def discover_candidates(
     underlying: str,
     budget: float,
     now: datetime | None = None,
+    *,
+    policy: config.OptionPolicy,
+    excluded_symbols: set[str] | frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Discover, verify, and rank tradable contracts for one underlying.
 
@@ -271,7 +274,7 @@ def discover_candidates(
     balanced call/put shortlist truncates `candidates` to `max_candidates`.
     """
 
-    policy = config.OPTIONS
+    # Freeze the caller's policy for the entire scan.
     moment = _normalize(now)
     today = moment.astimezone(NY).date()
     contracts = _fetch_contracts(
@@ -283,6 +286,9 @@ def discover_candidates(
     rejections: dict[str, int] = {}
     survivors: list[OptionContract] = []
     for contract in contracts:
+        if contract.symbol in excluded_symbols:
+            rejections["already_held_or_pending"] = rejections.get("already_held_or_pending", 0) + 1
+            continue
         reason = _metadata_rejection(contract, underlying, today, policy)
         if reason is None:
             survivors.append(contract)
@@ -310,6 +316,8 @@ def validate_candidate(
     budget: float,
     expected_price: float | None = None,
     now: datetime | None = None,
+    *,
+    policy: config.OptionPolicy,
 ) -> dict[str, Any]:
     """Refetch `symbol` from the broker and re-apply every discovery filter before execution.
 
@@ -317,7 +325,7 @@ def validate_candidate(
     refetched from the broker and its `underlying_symbol` is checked against `underlying`.
     """
 
-    policy = config.OPTIONS
+    # Revalidate with the current execution policy, not the scan's old limits.
     moment = _normalize(now)
     today = moment.astimezone(NY).date()
     contract = cast(OptionContract, trading.get_option_contract(symbol))

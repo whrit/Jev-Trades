@@ -9,6 +9,7 @@ import queue
 import threading
 import time
 import urllib.request
+from collections.abc import Mapping
 from copy import deepcopy
 from datetime import date, datetime, timezone
 from decimal import ROUND_DOWN, Decimal
@@ -21,6 +22,7 @@ from alpaca.data.historical import OptionHistoricalDataClient, StockHistoricalDa
 from alpaca.data.requests import OptionLatestQuoteRequest, StockLatestQuoteRequest
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import (
+    AssetClass,
     AssetStatus,
     OrderSide,
     PositionIntent,
@@ -37,6 +39,7 @@ from alpaca.trading.models import (
     TradeAccount,
 )
 from alpaca.trading.requests import (
+    GetAssetsRequest,
     GetOptionContractsRequest,
     GetOrdersRequest,
     LimitOrderRequest,
@@ -86,9 +89,9 @@ class PaperTrader:
         self.risk_appetite = risk_appetite
         self.api_key = os.getenv("TYPESAFE_API_KEY") or os.getenv("TYPESAFE_AI_API_KEY", "")
         self.enabled = False
-        self.selected_symbol = config.MARKET_SYMBOLS[0]
+        self.asset_directory: list[dict[str, str]] | None = None
         self.generation = 0
-        self.pending: queue.Queue = queue.Queue(maxsize=max(5, len(config.MARKET_SYMBOLS) * 10))
+        self.pending: queue.Queue = queue.Queue()
         self.queued: set[tuple[str, str, str]] = set()
         self.client = None
         self.stock_data = None
@@ -100,13 +103,19 @@ class PaperTrader:
         self.broker_status = "starting"
         self.broker_error: str | None = None
         self.synced_at = 0.0
-        self.option_scans: dict[str, dict[str, Any]] = {
-            s: {"status": "idle"} for s in config.OPTION_UNDERLYINGS
-        }
+        self.option_scans: dict[str, dict[str, Any]] = {}
         self.monitor_error: str | None = None
         self.chart_requests: dict[str, float] = {}
         self.started = False
         db.init_db()
+        self.option_policy = config.OptionPolicy.model_validate(
+            {**config.OPTIONS.model_dump(), **db.get_option_policy()}, strict=True
+        )
+        self.scope = config.TradingScope.model_validate(db.get_trading_scope())
+        self.pending.maxsize = max(
+            5, len(set(self.scope.stock_symbols + self.scope.option_underlyings)) * 10
+        )
+        self.option_scans = {s: {"status": "idle"} for s in self.scope.option_underlyings}
         self.orders = {o["client_order_id"]: o for o in db.get_orders()}
         self.exits = db.get_exits()
         self.instruments.update(
@@ -132,15 +141,60 @@ class PaperTrader:
         self.client = TradingClient(key, secret, paper=True)
         self.stock_data = StockHistoricalDataClient(key, secret)
         self.option_data = OptionHistoricalDataClient(key, secret)
-        for symbol in config.MARKET_SYMBOLS:
-            asset = cast(Asset, self.client.get_asset(symbol))
-            self.instruments[symbol] = {
-                "asset_class": "us_equity",
-                "multiplier": 1,
-                "tradable": asset.tradable and asset.status == AssetStatus.ACTIVE,
-                "fractionable": asset.fractionable,
-                "expiration": None,
-            }
+        self.asset_directory = None
+        for symbol in (*self.scope.stock_symbols, *self.scope.option_underlyings):
+            self.instruments[symbol] = self._stock_metadata(symbol)
+
+    def _stock_metadata(self, symbol: str) -> dict[str, Any]:
+        if self.client is None:
+            raise ValueError("Alpaca paper client is unavailable")
+        asset = cast(Asset, self.client.get_asset(symbol))
+        if asset.symbol != symbol or asset.asset_class != AssetClass.US_EQUITY:
+            raise ValueError("Expected a matching US stock/ETF asset")
+        return {
+            "asset_class": "us_equity",
+            "multiplier": 1,
+            "tradable": asset.tradable and asset.status == AssetStatus.ACTIVE,
+            "fractionable": asset.fractionable,
+            "expiration": None,
+        }
+
+    def search_assets(self, query: str) -> list[dict[str, str]]:
+        query = query.strip().upper()
+        if not query or len(query) > 80:
+            return []
+        with self.lock:
+            client = self._ready()
+            if self.asset_directory is None:
+                assets = cast(
+                    list[Asset],
+                    client.get_all_assets(
+                        GetAssetsRequest(
+                            status=AssetStatus.ACTIVE,
+                            asset_class=AssetClass.US_EQUITY,
+                        )
+                    ),
+                )
+                self.asset_directory = [
+                    {"symbol": a.symbol, "name": a.name or a.symbol}
+                    for a in assets
+                    if a.tradable
+                    and a.status == AssetStatus.ACTIVE
+                    and a.asset_class == AssetClass.US_EQUITY
+                ]
+            matches = [
+                a
+                for a in self.asset_directory
+                if query in a["symbol"] or query in a["name"].upper()
+            ]
+            return sorted(
+                matches,
+                key=lambda a: (
+                    a["symbol"] != query,
+                    not a["symbol"].startswith(query),
+                    a["symbol"],
+                ),
+            )[:20]
 
     def is_option(self, symbol: str) -> bool:
         return (
@@ -159,11 +213,12 @@ class PaperTrader:
             viewed = [
                 s for s, requested in self.chart_requests.items() if time.time() - requested <= 30
             ]
-            selected = [self.selected_symbol] if self.selected_symbol in self.instruments else []
+            selected = [self.scope.stock_symbol] if self.scope.stock_symbol else []
             return tuple(
                 dict.fromkeys(
                     [
-                        *config.MARKET_SYMBOLS,
+                        *self.scope.stock_symbols,
+                        *self.scope.option_underlyings,
                         *candidates,
                         *self.positions,
                         *pending,
@@ -185,7 +240,8 @@ class PaperTrader:
             try:
                 with self.lock:
                     if self.client is None or any(
-                        s not in self.instruments for s in config.MARKET_SYMBOLS
+                        s not in self.instruments
+                        for s in (*self.scope.stock_symbols, *self.scope.option_underlyings)
                     ):
                         self._connect()
                     self.refresh()
@@ -343,33 +399,78 @@ class PaperTrader:
         self.broker_status, self.broker_error = "connected", None
 
     def configure(
-        self, capital=None, max_wallet_position_pct=None, risk_appetite=None, api_key=None
+        self,
+        capital=None,
+        max_wallet_position_pct=None,
+        risk_appetite=None,
+        api_key=None,
+        option_policy: Mapping[str, Any] | None = None,
+        trading_scope: Mapping[str, Any] | None = None,
+        enabled: bool | None = None,
     ) -> None:
         with self.lock:
-            if capital is not None:
-                self.starting_cash = positive(capital, "Strategy budget")
-            if max_wallet_position_pct is not None:
-                pct = positive(max_wallet_position_pct, "Max position fraction")
-                if pct > 1:
-                    raise ValueError("Max position fraction cannot exceed 1")
-                self.max_wallet_position_pct = pct
-            if risk_appetite is not None:
-                if risk_appetite not in {"conservative", "balanced", "aggressive"}:
-                    raise ValueError("Invalid risk appetite")
-                self.risk_appetite = risk_appetite
-            if api_key:
-                self.api_key = api_key.strip()
-            self.generation += 1
-
-    def set_enabled(self, enabled: bool, symbol: str) -> None:
-        with self.lock:
-            if symbol not in self.symbols():
-                raise ValueError("Symbol is not configured")
+            policy = config.OptionPolicy.model_validate(
+                {**self.option_policy.model_dump(), **(option_policy or {})}, strict=True
+            )
+            scope = config.TradingScope.model_validate(
+                {**self.scope.model_dump(), **(trading_scope or {})}
+            )
+            additions = set((*scope.stock_symbols, *scope.option_underlyings)) - set(
+                (*self.scope.stock_symbols, *self.scope.option_underlyings)
+            )
+            instruments = {}
+            if additions:
+                self._ready()
+                for symbol in additions:
+                    instruments[symbol] = self._stock_metadata(symbol)
+                    if not instruments[symbol]["tradable"]:
+                        raise ValueError(f"{symbol} is not an active tradable stock/ETF")
+            capital = (
+                self.starting_cash if capital is None else positive(capital, "Strategy budget")
+            )
+            pct = (
+                self.max_wallet_position_pct
+                if max_wallet_position_pct is None
+                else positive(max_wallet_position_pct, "Max position fraction")
+            )
+            if pct > 1:
+                raise ValueError("Max position fraction cannot exceed 1")
+            risk = self.risk_appetite if risk_appetite is None else risk_appetite
+            if risk not in {"conservative", "balanced", "aggressive"}:
+                raise ValueError("Invalid risk appetite")
+            key = api_key.strip() if api_key else self.api_key
             if enabled:
                 self._ready()
-                if not self.api_key:
+                if not key:
                     raise ValueError("Set a TypeSafe API key before enabling automation")
-            self.enabled, self.selected_symbol = enabled, symbol
+            if option_policy is not None or trading_scope is not None:
+                db.save_configuration(
+                    {**db.get_option_policy(), **option_policy}
+                    if option_policy is not None
+                    else None,
+                    scope.model_dump(mode="json") if trading_scope is not None else None,
+                )
+                self.option_policy, self.scope = policy, scope
+                self.pending.maxsize = max(
+                    5, len(set(scope.stock_symbols + scope.option_underlyings)) * 10
+                )
+                self.instruments.update(instruments)
+                self.option_scans = {
+                    s: {
+                        **self.option_scans.get(s, {}),
+                        "status": "idle",
+                        "reason": "Settings updated; awaiting next strategy bar",
+                    }
+                    for s in scope.option_underlyings
+                }
+            self.starting_cash, self.max_wallet_position_pct, self.risk_appetite = (
+                capital,
+                pct,
+                risk,
+            )
+            self.api_key = key
+            if enabled is not None:
+                self.enabled = enabled
             self.generation += 1
 
     def _ready(self) -> TradingClient:
@@ -411,14 +512,30 @@ class PaperTrader:
                         "max_wallet_position_pct": self.max_wallet_position_pct,
                         "risk_appetite": self.risk_appetite,
                         "paper_trading": True,
+                        "options_exposure": (
+                            sum(
+                                max(0, p["market_value"])
+                                for s, p in self.positions.items()
+                                if self.is_option(s)
+                            )
+                            + sum(
+                                max(0, o["quantity"] - o["filled_qty"])
+                                * o["estimated_price"]
+                                * o["multiplier"]
+                                for o in self.orders.values()
+                                if o["side"] == "buy"
+                                and o["status"] not in TERMINAL
+                                and (self.is_option(o["symbol"]) or o["multiplier"] != 1)
+                            )
+                        )
+                        if self.account
+                        else None,
                     },
                     "agent_log": self.recent_logs[-15:],
                     "positions": trades[:100],
                     "orders": orders[:100],
                     "agent_enabled": bool(self.api_key),
-                    "stock_symbol": self.selected_symbol
-                    if self.selected_symbol in config.STOCK_SYMBOLS
-                    else None,
+                    "scope": self.scope.model_dump(mode="json"),
                     "broker_status": self.broker_status,
                     "broker_error": self.broker_error,
                     "option_scans": self.option_scans,
@@ -535,6 +652,7 @@ class PaperTrader:
     def _option_capacity(self, underlying: str, symbol: str | None = None) -> float:
         capital = min(self.starting_cash, self.account["equity"])
         option_exposure = underlying_exposure = 0.0
+        occupied: set[str] = set()
         for ticker, position in self.positions.items():
             instrument = self.instruments.get(ticker, {})
             exposure = max(0, position["market_value"])
@@ -542,9 +660,8 @@ class PaperTrader:
                 if not instrument.get("underlying") or position["quantity"] < 0:
                     return 0.0
                 option_exposure += exposure
-                # One long option position per underlying; no pyramiding or synthetic spreads.
                 if instrument["underlying"] == underlying and position["quantity"] > 0:
-                    return 0.0
+                    occupied.add(ticker)
             if ticker == underlying or instrument.get("underlying") == underlying:
                 underlying_exposure += exposure
         for order in self.orders.values():
@@ -558,20 +675,24 @@ class PaperTrader:
                 * order["multiplier"]
             )
             if self.is_option(ticker) or order["multiplier"] != 1:
-                if not instrument.get("underlying") or instrument["underlying"] == underlying:
+                if not instrument.get("underlying"):
                     return 0.0
+                if instrument["underlying"] == underlying:
+                    occupied.add(ticker)
                 option_exposure += reserved
             if ticker == underlying or instrument.get("underlying") == underlying:
                 underlying_exposure += reserved
-        risk = {"conservative": 0.5, "balanced": 0.75, "aggressive": 1.0}[self.risk_appetite]
+        # A partial fill and its remaining buy reserve one slot, not two. No pyramiding.
+        if symbol in occupied or len(occupied) >= self.option_policy.max_positions_per_underlying:
+            return 0.0
         return max(
             0.0,
             min(
                 self._buying_capacity(symbol or underlying),
                 self.account["options_buying_power"],
-                capital * config.OPTIONS.max_trade_pct * risk,
-                capital * config.OPTIONS.max_underlying_pct - underlying_exposure,
-                capital * config.OPTIONS.max_total_pct - option_exposure,
+                capital * self.option_policy.max_trade_pct,
+                capital * self.option_policy.max_underlying_pct - underlying_exposure,
+                capital * self.option_policy.max_total_pct - option_exposure,
             ),
         )
 
@@ -604,7 +725,7 @@ class PaperTrader:
             candidate = None
             if option and side == "buy":
                 underlying = instrument.get("underlying")
-                if underlying not in config.OPTION_UNDERLYINGS:
+                if underlying not in self.scope.option_underlyings:
                     raise ValueError("Option underlying is not in the entry watchlist")
                 if self.account["options_trading_level"] < 2:
                     raise ValueError("Long options require Alpaca options trading level 2")
@@ -617,9 +738,10 @@ class PaperTrader:
                     underlying,
                     self._option_capacity(underlying, symbol),
                     expected_price=expected_price,
+                    policy=self.option_policy,
                 )
                 self.instruments[symbol] = instrument = candidate
-            elif side == "buy" and symbol not in config.STOCK_SYMBOLS:
+            elif side == "buy" and symbol not in self.scope.stock_symbols:
                 raise ValueError("Stock is not in the stock-entry watchlist")
             quote = candidate["limit_price"] if candidate else self._quote(symbol, side)
             limit = (
@@ -884,7 +1006,7 @@ class PaperTrader:
                 raise ValueError("Unresolved order outcome prevents another exit submission")
             if (
                 order["side"] == "buy"
-                or time.time() - order["submitted_at"] >= config.OPTIONS.exit_reprice_seconds
+                or time.time() - order["submitted_at"] >= self.option_policy.exit_reprice_seconds
             ):
                 self.cancel_order(order["id"])
         if pending:
@@ -902,7 +1024,7 @@ class PaperTrader:
                 or order["status"] in TERMINAL
             ):
                 continue
-            if time.time() - order["submitted_at"] >= config.OPTIONS.entry_timeout_seconds:
+            if time.time() - order["submitted_at"] >= self.option_policy.entry_timeout_seconds:
                 try:
                     if not order.get("id"):
                         raise ValueError(
@@ -924,7 +1046,7 @@ class PaperTrader:
                     )
                 targets = self.exits[symbol]
                 reason = targets.get("exit_reason")
-                if (expiration - today).days <= config.OPTIONS.exit_dte:
+                if (expiration - today).days <= self.option_policy.exit_dte:
                     reason = reason or "near_expiry"
                 if not reason:
                     bid = self._quote(symbol, "sell")
@@ -955,6 +1077,8 @@ class PaperTrader:
         underlying = state["symbol"]
         self._fresh_underlying(state)
         with self.lock:
+            if not self.scope.options_enabled or underlying not in self.scope.option_underlyings:
+                return {}
             client = self._ready()
             self.refresh()
             if self.option_data is None:
@@ -962,6 +1086,13 @@ class PaperTrader:
             if not cast(Clock, client.get_clock()).is_open:
                 raise ValueError("Regular market session is closed")
             budget = self._option_capacity(underlying)
+            policy, generation = self.option_policy, self.generation
+            excluded = {s for s, p in self.positions.items() if p["quantity"] > 0}
+            excluded.update(
+                o["symbol"]
+                for o in self.orders.values()
+                if o["side"] == "buy" and o["status"] not in TERMINAL
+            )
             held = [
                 dict(p)
                 for s, p in self.positions.items()
@@ -970,10 +1101,21 @@ class PaperTrader:
                 and p["quantity"] > 0
                 and s in self.exits
             ]
-            self.option_scans[underlying] = {"status": "scanning", "as_of": time.time()}
+            self.option_scans[underlying] = {
+                **self.option_scans.get(underlying, {}),
+                "status": "scanning",
+                "started_at": time.time(),
+            }
         try:
             scan = (
-                options.discover_candidates(client, self.option_data, underlying, budget)
+                options.discover_candidates(
+                    client,
+                    self.option_data,
+                    underlying,
+                    budget,
+                    policy=policy,
+                    excluded_symbols=excluded,
+                )
                 if budget > 0
                 else {
                     "candidates": [],
@@ -993,7 +1135,17 @@ class PaperTrader:
                 "as_of": time.time(),
             }
         with self.lock:
-            self.option_scans[underlying] = scan
+            if generation != self.generation:
+                return {}
+            self.option_scans[underlying] = (
+                {
+                    **self.option_scans.get(underlying, {}),
+                    "status": "blocked",
+                    "error": scan["error"],
+                }
+                if scan.get("error")
+                else scan
+            )
             for candidate in scan["candidates"]:
                 self.instruments[candidate["symbol"]] = candidate
             supported = set(self.symbols())
@@ -1005,7 +1157,7 @@ class PaperTrader:
             "candidates": scan["candidates"],
             "option_positions": held,
             "option_budget": budget,
-            "option_policy": config.OPTIONS.model_dump(),
+            "option_policy": policy.model_dump(),
             "option_feed": config.OPTION_FEED.value,
             "scan_reason": scan.get("error", scan.get("reason", "No eligible option contracts")),
         }
@@ -1029,22 +1181,29 @@ class PaperTrader:
         event = {
             "timestamp": time.time(),
             "symbol": state["symbol"],
+            "strategy": "options",
+            "time_frame": state.get("time_frame"),
             "action": choice,
             "confidence": confidence,
             "executed": "hold",
             "request": state,
             "response": response,
         }
-        threshold = {"conservative": 0.75, "balanced": 0.6, "aggressive": 0.5}[self.risk_appetite]
+        threshold = self.option_policy.min_confidence
         if choice == "hold" or confidence < threshold:
+            event["reason"] = (
+                "Model selected hold"
+                if choice == "hold"
+                else f"Confidence below {threshold:.0%} minimum"
+            )
             return event
         self._fresh_underlying(state)
         action, symbol = choice.split(":", 1)
         if action == "buy":
             candidate = next(c for c in state["candidates"] if c["symbol"] == symbol)
             targets = {
-                "premium_stop_pct": config.OPTIONS.stop_loss_pct,
-                "premium_take_pct": config.OPTIONS.take_profit_pct,
+                "premium_stop_pct": self.option_policy.stop_loss_pct,
+                "premium_take_pct": self.option_policy.take_profit_pct,
                 "tp_sl_source": "jev-options",
             }
             order = self._order(
@@ -1074,12 +1233,13 @@ class PaperTrader:
                 return
             symbol = state["symbol"]
             if strategy == "options":
-                if symbol not in config.OPTION_UNDERLYINGS:
+                if not self.scope.options_enabled or symbol not in self.scope.option_underlyings:
                     return
             elif (
                 strategy != "stock"
-                or symbol != self.selected_symbol
-                or symbol not in config.STOCK_SYMBOLS
+                or not self.scope.stock_enabled
+                or symbol != self.scope.stock_symbol
+                or symbol not in self.scope.stock_symbols
             ):
                 return
             key = (strategy, symbol, state.get("time_frame", "1m"))
@@ -1107,11 +1267,15 @@ class PaperTrader:
                         continue
                 if state["strategy"] == "options":
                     state = self._prepare_options(state)
+                    if not state:
+                        continue
                     if not state["candidates"] and not state["option_positions"]:
                         self._log_event(
                             {
                                 "timestamp": time.time(),
                                 "symbol": state["symbol"],
+                                "strategy": state["strategy"],
+                                "time_frame": state.get("time_frame"),
                                 "action": "hold",
                                 "executed": "hold",
                                 "confidence": None,
@@ -1150,23 +1314,27 @@ class PaperTrader:
                         continue
                     self._log_event(self._apply_decision(state, result))
             except Exception as error:
-                if state["strategy"] == "options":
-                    with self.lock:
+                with self.lock:
+                    if generation != self.generation:
+                        continue
+                    if state["strategy"] == "options":
                         self.option_scans[state["symbol"]] = {
                             **self.option_scans.get(state["symbol"], {}),
                             "status": "blocked",
                             "error": str(error),
                         }
-                self._log_event(
-                    {
-                        "timestamp": time.time(),
-                        "symbol": state["symbol"],
-                        "action": "error",
-                        "executed": "hold",
-                        "confidence": None,
-                        "error": str(error),
-                    }
-                )
+                    self._log_event(
+                        {
+                            "timestamp": time.time(),
+                            "symbol": state["symbol"],
+                            "strategy": state["strategy"],
+                            "time_frame": state.get("time_frame"),
+                            "action": "error",
+                            "executed": "hold",
+                            "confidence": None,
+                            "error": str(error),
+                        }
+                    )
             finally:
                 with self.lock:
                     self.queued.discard(key)
@@ -1182,6 +1350,9 @@ class PaperTrader:
         threshold = {"conservative": 0.75, "balanced": 0.6, "aggressive": 0.5}[self.risk_appetite]
         event = {
             "timestamp": time.time(),
+            "symbol": state["symbol"],
+            "strategy": "stock",
+            "time_frame": state.get("time_frame"),
             "price": state["current_price"],
             "action": action,
             "confidence": confidence,
@@ -1192,6 +1363,11 @@ class PaperTrader:
         if not math.isfinite(confidence) or not 0 <= confidence <= 1:
             raise ValueError("Invalid agent confidence")
         if confidence < threshold or action not in {"buy", "sell"}:
+            event["reason"] = (
+                f"Confidence below {threshold:.0%} minimum"
+                if confidence < threshold
+                else "Model selected hold"
+            )
             return event
         symbol, price = state["symbol"], positive(state["current_price"], "Price")
         if self._open_orders(symbol):

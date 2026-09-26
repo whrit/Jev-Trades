@@ -57,6 +57,29 @@ class Broker:
     def get_clock(self):
         return Model(is_open=True)
 
+    def get_asset(self, symbol):
+        names = {
+            "SPY": "SPDR S&P 500 ETF",
+            "QQQ": "Invesco QQQ Trust",
+            "AAPL": "Apple Inc.",
+            "MSFT": "Microsoft Corporation",
+            "NVDA": "NVIDIA Corporation",
+            "BAD": "Untradable asset",
+        }
+        if symbol not in names:
+            raise ValueError("Unknown asset")
+        return Model(
+            symbol=symbol,
+            name=names[symbol],
+            asset_class=AssetClass.US_EQUITY,
+            status=AssetStatus.ACTIVE,
+            tradable=symbol != "BAD",
+            fractionable=True,
+        )
+
+    def get_all_assets(self, request):
+        return [self.get_asset(symbol) for symbol in ("SPY", "QQQ", "AAPL", "MSFT", "NVDA", "BAD")]
+
     def get_option_contract(self, symbol):
         return Model(
             symbol=symbol,
@@ -170,6 +193,186 @@ class Quotes:
 
 
 class PaperLifecycle(unittest.TestCase):
+    def test_scope_persistence_atomic_validation_and_independent_strategy_gates(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(db, "DB_PATH", Path(directory) / "paper.db"),
+            patch.object(config, "OPTION_UNDERLYINGS", ("SPY",)),
+        ):
+            trader = PaperTrader()
+            broker = Broker()
+            trader.client = cast(TradingClient, broker)
+            trader.refresh()
+            trader.api_key = "offline-test"
+            trader.configure(enabled=True)
+            trader.submit({"symbol": "SPY"}, strategy="stock")
+            old_generation, _, _ = trader.pending.get_nowait()
+            trader.queued.clear()
+            trader.configure(
+                trading_scope={
+                    "stock_enabled": False,
+                    "option_underlyings": [" spy ", "QQQ", "SPY"],
+                }
+            )
+            self.assertEqual(trader.scope.option_underlyings, ("SPY", "QQQ"))
+            self.assertNotEqual(old_generation, trader.generation)
+            trader.submit({"symbol": "SPY"}, strategy="stock")
+            self.assertTrue(trader.pending.empty())
+            trader.submit({"symbol": "QQQ"}, strategy="options")
+            self.assertEqual(trader.pending.get_nowait()[2]["strategy"], "options")
+            saved = db.get_trading_scope()
+            generation = trader.generation
+            with self.assertRaises(ValueError):
+                trader.configure(
+                    capital=1234,
+                    option_policy={"max_contracts": 2},
+                    trading_scope={"option_underlyings": ["BAD"]},
+                )
+            self.assertEqual(db.get_trading_scope(), saved)
+            self.assertEqual(db.get_option_policy(), {})
+            self.assertEqual((trader.starting_cash, trader.generation), (100000, generation))
+            self.assertEqual(
+                trader.search_assets("apple"), [{"symbol": "AAPL", "name": "Apple Inc."}]
+            )
+            self.assertEqual(trader.search_assets("untradable"), [])
+            restarted = PaperTrader()
+            self.assertEqual(restarted.scope, trader.scope)
+            self.assertFalse(restarted.enabled)
+            trader.configure(
+                trading_scope={
+                    "stock_symbols": [],
+                    "stock_symbol": "",
+                    "stock_enabled": False,
+                    "option_underlyings": [],
+                    "options_enabled": False,
+                }
+            )
+            self.assertEqual(PaperTrader().scope.option_underlyings, ())
+            trader.submit({"symbol": "SPY"}, strategy="options")
+            self.assertTrue(trader.pending.empty())
+
+    def test_rescan_retains_results_and_scope_change_discards_inflight_result(self):
+        from pipeline import options
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(db, "DB_PATH", Path(directory) / "paper.db"),
+            patch.object(config, "OPTION_UNDERLYINGS", ("SPY",)),
+        ):
+            trader = PaperTrader()
+            trader.client = cast(TradingClient, Broker())
+            trader.option_data = cast(OptionHistoricalDataClient, Quotes())
+            trader.refresh()
+            previous = {
+                "status": "ready",
+                "eligible": 7,
+                "discovered": 20,
+                "candidates": [],
+                "as_of": 100,
+            }
+            trader.option_scans["SPY"] = previous
+            state = {
+                "symbol": "SPY",
+                "current_price": 600,
+                "quote_time": time.time(),
+                "bar_time": time.time() - 60,
+            }
+            with patch.object(
+                options, "discover_candidates", side_effect=ValueError("Quote feed unavailable")
+            ):
+                self.assertEqual(trader._prepare_options(state)["candidates"], [])
+            self.assertEqual(
+                (trader.option_scans["SPY"]["eligible"], trader.option_scans["SPY"]["as_of"]),
+                (7, 100),
+            )
+            self.assertEqual(trader.option_scans["SPY"]["status"], "blocked")
+
+            def discover(*args, **kwargs):
+                scan = trader.option_scans["SPY"]
+                self.assertEqual(
+                    (scan["status"], scan["eligible"], scan["as_of"]), ("scanning", 7, 100)
+                )
+                trader.configure(trading_scope={"option_underlyings": ["QQQ"]})
+                return {"eligible": 2, "discovered": 3, "candidates": [], "as_of": time.time()}
+
+            with patch.object(options, "discover_candidates", side_effect=discover):
+                self.assertEqual(trader._prepare_options(state), {})
+            self.assertNotIn("SPY", trader.option_scans)
+            self.assertEqual(trader.scope.option_underlyings, ("QQQ",))
+
+    def test_option_slots_deduplicate_partial_fills_and_reserve_shared_exposure(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(db, "DB_PATH", Path(directory) / "paper.db"),
+        ):
+            trader = PaperTrader(capital=10000)
+            trader.account = {
+                "equity": 10000,
+                "cash_balance": 10000,
+                "available_cash": 10000,
+                "options_buying_power": 10000,
+            }
+            trader.configure(
+                option_policy={
+                    "max_trade_pct": 0.10,
+                    "max_underlying_pct": 0.25,
+                    "max_total_pct": 0.75,
+                    "max_positions_per_underlying": 2,
+                }
+            )
+            trader.instruments = {
+                "A": {"asset_class": "us_option", "underlying": "SPY"},
+                "B": {"asset_class": "us_option", "underlying": "SPY"},
+                "C": {"asset_class": "us_option", "underlying": "AAPL"},
+            }
+            trader.positions = {"A": {"quantity": 1, "market_value": 400}}
+            trader.orders = {
+                "a": {
+                    "symbol": "A",
+                    "side": "buy",
+                    "status": "partially_filled",
+                    "quantity": 3,
+                    "filled_qty": 1,
+                    "estimated_price": 4,
+                    "multiplier": 100,
+                }
+            }
+            self.assertEqual(trader._option_capacity("SPY", "A"), 0)  # No pyramiding.
+            self.assertEqual(
+                trader._option_capacity("SPY", "B"), 1000
+            )  # Partial + pending uses one slot.
+            trader.orders["b"] = {
+                "symbol": "B",
+                "side": "buy",
+                "status": "accepted",
+                "quantity": 1,
+                "filled_qty": 0,
+                "estimated_price": 2,
+                "multiplier": 100,
+            }
+            self.assertEqual(trader._option_capacity("SPY"), 0)
+            self.assertEqual(trader._option_capacity("AAPL"), 1000)
+            trader.configure(option_policy={"max_positions_per_underlying": 3})
+            trader.positions["SPY"] = {"quantity": 1, "market_value": 800}
+            self.assertEqual(trader._option_capacity("SPY"), 300)
+            trader.orders["stock"] = {
+                "symbol": "SPY",
+                "side": "buy",
+                "status": "accepted",
+                "quantity": 1,
+                "filled_qty": 0,
+                "estimated_price": 100,
+                "multiplier": 1,
+            }
+            self.assertEqual(trader._option_capacity("SPY"), 200)
+            trader.orders["stock"]["status"] = "canceled"
+            self.assertEqual(trader._option_capacity("SPY"), 300)
+            trader.positions["C"] = {"quantity": 30, "market_value": 6000}
+            self.assertEqual(trader._option_capacity("SPY"), 100)
+            trader.configure(option_policy={"max_total_pct": 0.70})
+            self.assertEqual(trader._option_capacity("SPY"), 0)
+            self.assertEqual(set(trader.positions), {"A", "SPY", "C"})
+
     def test_viewed_contract_remains_chartable_after_leaving_shortlist(self):
         with (
             tempfile.TemporaryDirectory() as directory,
@@ -210,6 +413,9 @@ class PaperLifecycle(unittest.TestCase):
         ):
             broker, quotes = Broker(), Quotes()
             trader = PaperTrader()
+            trader.configure(
+                option_policy={"max_trade_pct": 0.0075}
+            )  # Explicit $750 premium ceiling.
             trader.client = cast(TradingClient, broker)
             trader.option_data = cast(OptionHistoricalDataClient, quotes)
             trader.refresh()
@@ -406,10 +612,10 @@ class PaperLifecycle(unittest.TestCase):
                 trader.manual_buy("SPY", 600, quantity=0.5)
             self.assertEqual(len(broker.requests), before)
             trader.api_key = "offline-test"
-            trader.set_enabled(True, "SPY")
+            trader.configure(enabled=True)
             trader.submit({"symbol": "SPY", "current_price": 600})
             generation, _, _ = trader.pending.get_nowait()
-            trader.set_enabled(False, "SPY")
+            trader.configure(enabled=False)
             self.assertNotEqual(generation, trader.generation)
             trader.submit({"symbol": "SPY", "current_price": 600})
             self.assertTrue(trader.pending.empty())
@@ -440,6 +646,8 @@ class PaperLifecycle(unittest.TestCase):
             trader.manual_buy(OPTION, 2, quantity=3, stop_loss_pct=5)
             broker.fill(broker.orders[0], 1, 1.95)
             trader.refresh()
+            trader.configure(trading_scope={"option_underlyings": [], "options_enabled": False})
+            self.assertNotIn("SPY", trader.scope.option_underlyings)
             quotes.bid, quotes.ask = 1.8, 1.81
             self.assertFalse(trader.enabled)
             self.assertIsNone(trader.check_tp_sl(OPTION, 1.8))

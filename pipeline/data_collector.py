@@ -36,7 +36,7 @@ else:
     from api_models import CONFIG_PAYLOAD, ORDER_PAYLOAD
     from paper_trader import PaperTrader
 
-MARKET_SYMBOLS = config.MARKET_SYMBOLS
+
 TIMEFRAMES = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8765"))
@@ -47,11 +47,11 @@ STORE_DIR = Path(__file__).with_name("alpaca_market_data")
 class MarketState:
     def __init__(self) -> None:
         self.lock = threading.RLock()
-        self.selected_symbol = MARKET_SYMBOLS[0]
+        self.selected_symbol = next(iter(TRADER.symbols()), "")
         self.trading_enabled = False
         self.markets = {
             s: {"bars": [], "price": None, "last_tick": None, "status": "starting", "error": None}
-            for s in MARKET_SYMBOLS
+            for s in TRADER.symbols()
         }
         self.capital = 100_000.0
         self.max_wallet_position_pct = 0.75
@@ -61,14 +61,19 @@ class MarketState:
 
     def snapshot(self, symbol: str | None = None, timeframe: str | None = None) -> dict[str, Any]:
         with self.lock, TRADER.lock:
-            selected = symbol or self.selected_symbol
+            selected = symbol or (
+                self.selected_symbol
+                if self.selected_symbol in TRADER.symbols()
+                else next(iter(TRADER.symbols()), "")
+            )
             tf = timeframe or self.chart_timeframe
             supported = TRADER.symbols()
             if selected not in supported and selected in TRADER.instruments:
                 supported = (*supported, selected)
-            if selected not in supported or tf not in TIMEFRAMES:
+            if (selected and selected not in supported) or tf not in TIMEFRAMES:
                 raise ValueError("Unknown symbol or timeframe")
-            TRADER.chart_requests[selected] = time.time()
+            if selected:
+                TRADER.chart_requests[selected] = time.time()
             market = self.markets.setdefault(
                 selected,
                 {"bars": [], "price": None, "last_tick": None, "status": "starting", "error": None},
@@ -79,14 +84,14 @@ class MarketState:
             return {
                 "symbol": selected,
                 "supported_symbols": supported,
-                "stock_symbols": config.STOCK_SYMBOLS,
+                "trading_scope": TRADER.scope.model_dump(mode="json"),
                 "instruments": {
                     s: TRADER.instruments.get(s, {"asset_class": "us_equity", "multiplier": 1})
                     for s in supported
                 },
                 "options": {
-                    "underlyings": config.OPTION_UNDERLYINGS,
-                    "policy": config.OPTIONS.model_dump(),
+                    "underlyings": TRADER.scope.option_underlyings,
+                    "policy": TRADER.option_policy.model_dump(),
                     "feed": config.OPTION_FEED.value,
                 },
                 "data_feeds": {
@@ -113,8 +118,8 @@ class MarketState:
             }
 
 
-STATE = MarketState()
 TRADER = PaperTrader()
+STATE = MarketState()
 
 
 def _series(bars: list[dict[str, Any]], key: str) -> pd.Series:
@@ -318,10 +323,8 @@ def merge_bars(symbol: str, incoming: list[Any]) -> None:
             for tf in STATE.active_timeframes:
                 if (latest + 60) // TIMEFRAMES[tf] > (previous + 60) // TIMEFRAMES[tf]:
                     state = build_agent_state(symbol, tf)
-                    if symbol in config.OPTION_UNDERLYINGS:
-                        TRADER.submit(state, strategy="options")
-                    if symbol == STATE.selected_symbol and symbol in config.STOCK_SYMBOLS:
-                        TRADER.submit(state, strategy="stock")
+                    TRADER.submit(state, strategy="options")
+                    TRADER.submit(state, strategy="stock")
 
 
 def build_agent_state(symbol: str, timeframe: str = "1m") -> dict[str, Any]:
@@ -435,7 +438,7 @@ def build_agent_state(symbol: str, timeframe: str = "1m") -> dict[str, Any]:
 def market_worker() -> None:
     clients = None
     last_history: dict[str, float] = {}
-    for symbol in MARKET_SYMBOLS:
+    for symbol in TRADER.symbols():
         path = STORE_DIR / f"{symbol}.json"
         if path.exists():
             try:
@@ -453,9 +456,29 @@ def market_worker() -> None:
                 for s, requested in TRADER.chart_requests.items()
                 if time.time() - requested <= 30
             }
-            watched = tuple(dict.fromkeys([*MARKET_SYMBOLS, *TRADER.chart_requests]))
+            watched = tuple(
+                dict.fromkeys(
+                    [
+                        *TRADER.scope.stock_symbols,
+                        *TRADER.scope.option_underlyings,
+                        *TRADER.positions,
+                        *TRADER.chart_requests,
+                    ]
+                )
+            )
         for symbol in watched:
             try:
+                with STATE.lock:
+                    STATE.markets.setdefault(
+                        symbol,
+                        {
+                            "bars": [],
+                            "price": None,
+                            "last_tick": None,
+                            "status": "starting",
+                            "error": None,
+                        },
+                    )
                 if clients is None:
                     key, secret = config.credentials()
                     clients = (
@@ -527,24 +550,25 @@ def market_worker() -> None:
 def configure(payload: dict[str, Any]) -> None:
     request = CONFIG_PAYLOAD.validate_python(payload)
     with STATE.lock, TRADER.lock:
-        symbol = request.get("symbol", STATE.selected_symbol)
         enabled = request.get("trading_enabled", STATE.trading_enabled)
         frames = request.get("active_timeframes", STATE.active_timeframes)
         capital = request.get("capital", STATE.capital)
         pct = request.get("max_wallet_position_pct", STATE.max_wallet_position_pct)
         risk = request.get("risk_appetite", STATE.risk_appetite)
         key = request.get("typesafe_api_key")
-        if symbol not in TRADER.symbols():
-            raise ValueError("Symbol is not configured")
+
         if any(tf not in TIMEFRAMES for tf in frames):
             raise ValueError("Choose supported analysis timeframes")
-        if enabled:
-            TRADER._ready()
-            if not (key and key.strip()) and not TRADER.api_key:
-                raise ValueError("Set a TypeSafe key before enabling automation")
-        TRADER.configure(capital, pct, risk, key)
-        TRADER.set_enabled(enabled, symbol)
-        STATE.selected_symbol, STATE.trading_enabled = symbol, enabled
+        TRADER.configure(
+            capital,
+            pct,
+            risk,
+            key,
+            option_policy=request.get("option_policy"),
+            trading_scope=request.get("trading_scope"),
+            enabled=enabled,
+        )
+        STATE.trading_enabled = enabled
         STATE.capital, STATE.max_wallet_position_pct, STATE.risk_appetite = capital, pct, risk
         STATE.active_timeframes = list(dict.fromkeys(frames))
 
@@ -593,6 +617,11 @@ class FeedHandler(BaseHTTPRequestHandler):
                 return
             if url.path == "/history":
                 self.send_json(TRADER.history())
+                return
+            if url.path == "/assets":
+                self.send_json(
+                    {"ok": True, "assets": TRADER.search_assets(query.get("query", [""])[0])}
+                )
                 return
             if url.path == "/contracts":
                 self.send_json(
@@ -652,7 +681,15 @@ class FeedHandler(BaseHTTPRequestHandler):
             path = urlparse(self.path).path
             if path == "/config":
                 configure(payload)
-                self.send_json({"ok": True, "settings": STATE.snapshot()["settings"]})
+                self.send_json(
+                    {
+                        "ok": True,
+                        "settings": STATE.snapshot()["settings"],
+                        "option_policy": TRADER.option_policy.model_dump(),
+                        "trading_scope": TRADER.scope.model_dump(mode="json"),
+                        "trading_enabled": TRADER.enabled,
+                    }
+                )
                 return
             if path != "/order":
                 self.send_error(404)

@@ -54,5 +54,15 @@ export default defineConfig({
   overrides: [
     { files: ["app/**"], env: { browser: true, node: true } },
     { files: ["*.config.{ts,mjs}"], env: { node: true } },
+    {
+      // shadcn/ui primitives: the input-group addon's click-to-focus is a
+      // mouse convenience; keyboard users reach the input directly.
+      files: ["components/ui/**"],
+      rules: {
+        "jsx-a11y/prefer-tag-over-role": "off",
+        "jsx-a11y/click-events-have-key-events": "off",
+        "jsx-a11y/no-noninteractive-element-interactions": "off",
+      },
+    },
   ],
 });

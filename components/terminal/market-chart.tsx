@@ -13,15 +13,11 @@ import {
   type UTCTimestamp,
 } from "lightweight-charts";
 
-type Bar = {
-  time: number;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
-};
-type IndicatorSeries = { ema20: (number | null)[]; sma50: (number | null)[] };
+import { chartColors as colors, type Bar, type Snapshot } from "@/lib/terminal";
+
+const volumeColor = (bar: Bar) =>
+  bar.close >= bar.open ? colors.upVolume : colors.downVolume;
+type IndicatorSeries = Snapshot["indicator_series"];
 type PositionData = {
   average_entry_price?: number;
   stop_loss_price?: number | null;
@@ -68,36 +64,40 @@ export default function MarketChart({
     overlayStateRef.current = "";
     priceLinesRef.current = {};
     const chart = createChart(containerRef.current, {
+      autoSize: true,
       layout: {
-        background: { type: ColorType.Solid, color: "#111a29" },
-        textColor: "#a0adbf",
+        background: { type: ColorType.Solid, color: colors.bg },
+        textColor: colors.text,
         fontFamily: getComputedStyle(document.body).fontFamily,
+        fontSize: 11,
+        attributionLogo: false,
       },
       grid: {
-        vertLines: { color: "#1e2c43" },
-        horzLines: { color: "#1e2c43" },
+        vertLines: { color: colors.grid },
+        horzLines: { color: colors.grid },
       },
-      width: containerRef.current.clientWidth,
-      height: 440,
-      rightPriceScale: { borderColor: "#29364a" },
+      crosshair: {
+        vertLine: { color: colors.text, labelBackgroundColor: "#1d232c" },
+        horzLine: { color: colors.text, labelBackgroundColor: "#1d232c" },
+      },
+      rightPriceScale: { borderColor: colors.border },
       timeScale: {
-        borderColor: "#29364a",
+        borderColor: colors.border,
         timeVisible: true,
         secondsVisible: false,
       },
     });
     const candles = chart.addSeries(CandlestickSeries, {
-      upColor: "#82b5ff",
-      downColor: "#ef7156",
+      upColor: colors.up,
+      downColor: colors.down,
       borderVisible: false,
-      wickUpColor: "#82b5ff",
-      wickDownColor: "#ef7156",
+      wickUpColor: colors.up,
+      wickDownColor: colors.down,
       priceFormat: { type: "price", minMove: 0.01 },
     });
     const volume = chart.addSeries(HistogramSeries, {
       priceFormat: { type: "volume" },
       priceScaleId: "",
-      color: "#3f577b",
       lastValueVisible: false,
       priceLineVisible: false,
     });
@@ -106,17 +106,11 @@ export default function MarketChart({
       .applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
     seriesRef.current = { candles, volume };
     chartRef.current = chart;
-    const observer = new ResizeObserver(() =>
-      chart.applyOptions({ width: containerRef.current?.clientWidth ?? 800 }),
-    );
-    observer.observe(containerRef.current);
     return () => {
-      observer.disconnect();
       chart.remove();
       chartRef.current = null;
     };
   }, []);
-
   useEffect(() => {
     for (const name of ["candles", "ema20", "sma50"] as const) {
       seriesRef.current[name]?.applyOptions({
@@ -144,7 +138,7 @@ export default function MarketChart({
     const latestVolume = {
       time: latestBar.time as UTCTimestamp,
       value: latestBar.volume,
-      color: latestBar.close >= latestBar.open ? "#365b8e" : "#693e3b",
+      color: volumeColor(latestBar),
     };
     if (!initializedRef.current) {
       candles.setData(
@@ -154,7 +148,7 @@ export default function MarketChart({
         sortedBars.map((bar) => ({
           time: bar.time as UTCTimestamp,
           value: bar.volume,
-          color: bar.close >= bar.open ? "#365b8e" : "#693e3b",
+          color: volumeColor(bar),
         })),
       );
       initializedRef.current = true;
@@ -171,7 +165,7 @@ export default function MarketChart({
         sortedBars.map((bar) => ({
           time: bar.time as UTCTimestamp,
           value: bar.volume,
-          color: bar.close >= bar.open ? "#365b8e" : "#693e3b",
+          color: volumeColor(bar),
         })),
       );
       chartRef.current?.timeScale().fitContent();
@@ -188,7 +182,7 @@ export default function MarketChart({
           sortedBars.map((bar) => ({
             time: bar.time as UTCTimestamp,
             value: bar.volume,
-            color: bar.close >= bar.open ? "#365b8e" : "#693e3b",
+            color: volumeColor(bar),
           })),
         );
       }
@@ -205,10 +199,11 @@ export default function MarketChart({
       }
       if (!seriesRef.current[name]) {
         seriesRef.current[name] = chart.addSeries(LineSeries, {
-          color: name === "ema20" ? "#f3b85b" : "#71b7d5",
-          lineWidth: 2,
+          color: name === "ema20" ? colors.ema20 : colors.sma50,
+          lineWidth: 1,
           priceLineVisible: false,
           lastValueVisible: false,
+          crosshairMarkerVisible: false,
           priceFormat: {
             type: "price",
             minMove: priceFormat?.minMove ?? 0.01,
@@ -264,31 +259,31 @@ export default function MarketChart({
       if (average_entry_price) {
         priceLinesRef.current.entry = candles.createPriceLine({
           price: average_entry_price,
-          color: "#38bdf8",
+          color: colors.accent,
           lineWidth: 1,
           lineStyle: LineStyle.Solid,
           axisLabelVisible: true,
-          title: "ENTRY",
+          title: "Entry",
         });
       }
       if (take_profit_price) {
         priceLinesRef.current.tp = candles.createPriceLine({
           price: take_profit_price,
-          color: "#82b5ff",
+          color: colors.up,
           lineWidth: 1,
           lineStyle: LineStyle.Dashed,
           axisLabelVisible: true,
-          title: "TAKE PROFIT",
+          title: "TP",
         });
       }
       if (stop_loss_price) {
         priceLinesRef.current.sl = candles.createPriceLine({
           price: stop_loss_price,
-          color: "#ef7156",
+          color: colors.down,
           lineWidth: 1,
           lineStyle: LineStyle.Dashed,
           axisLabelVisible: true,
-          title: "STOP LOSS",
+          title: "SL",
         });
       }
     }
@@ -297,7 +292,7 @@ export default function MarketChart({
   return (
     <div
       ref={containerRef}
-      className="chart-shell"
+      className="size-full min-h-0"
       aria-label="Selected instrument candlestick chart"
     />
   );

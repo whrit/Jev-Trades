@@ -91,7 +91,7 @@ Orders require a quote no more than 30 seconds old. Stocks/options also require 
 
 ## Paper trading workflow
 
-**Terminal** keeps account equity, available cash, held-plus-reserved options exposure, and applied strategy intervals above the watchlist, chart, and manual trade panel. Positions, open orders, recent decisions, and fill summaries appear below. **Activity** focuses those records; **Settings** contains trading scope, budget, strategy evaluation intervals, TypeSafe connection, and option risk limits. Chart navigation and the compact indicator picker only change the view.
+**Terminal** is a single-screen layout: account equity, available cash, held-plus-reserved options exposure, and applied strategy intervals sit in the top bar next to the automation switch; the watchlist, chart, and order ticket fill the middle, with positions, open orders, recent decisions, and fill summaries in the blotter below the chart. The selected symbol's open position (P&L, TP/SL, close and edit controls) appears under the order ticket. **Activity** expands the blotter; **Settings** contains trading scope, budget, strategy evaluation intervals, TypeSafe connection, and option risk limits. Press `/` or `Cmd/Ctrl+K` to switch the chart symbol. Chart navigation and the indicator picker only change the view. Every order, cancel, settings change, and automation toggle asks for confirmation in a dialog that lists exactly what will be sent.
 
 Unsaved settings survive live snapshots and navigation between workspace views. Scans retain their last completed counts, candidates, and timestamp while updating or reporting an error; failed/stale scans are not reused for automatic entries. Decision rows identify ticker, strategy, interval, action, confidence, and timestamp, with expandable actual context/response. Holds do not display invented execution prices.
 
@@ -203,7 +203,7 @@ The service binds to loopback by default. Browser origins are restricted to `htt
 
 `oxlint.config.ts` and `oxfmt.config.ts` are auto-discovered from the repository root. Oxlint runs native TypeScript, React/hooks, Next.js, accessibility, import, Unicorn, and Oxc correctness checks; warnings and unused suppression directives fail the check. Browser/Node globals use built-in environments rather than a generated globals list. TypeScript compiler checking remains a separate `tsc` step; experimental Oxlint type checking and React Compiler rules are not enabled.
 
-Oxfmt owns formatting for frontend code, CSS, JSON, Markdown, and supported project configuration files, using an 80-column print width. Generated output, lockfiles, agent instructions, and the Python pipeline are excluded. Python formatting remains with Ruff. The dashboard uses blue accents and cool dark surfaces; red remains reserved for losses and errors.
+Oxfmt owns formatting for frontend code, CSS, JSON, Markdown, and supported project configuration files, using an 80-column print width. Generated output, lockfiles, agent instructions, and the Python pipeline are excluded. Python formatting remains with Ruff. UI primitives are shadcn/ui (Radix, `radix-mira` style, Phosphor icons) in `components/ui/`, owned and customized in place; terminal panels live in `components/terminal/`. The dashboard is dark-only with a single blue accent; green and red are reserved for direction (buy/gain, sell/loss/error). Theme tokens are in `app/globals.css`, mirrored for the chart canvas in `lib/terminal.ts`.
 
 ```sh
 pnpm lint          # Check source; no writes
